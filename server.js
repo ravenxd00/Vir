@@ -1,151 +1,226 @@
 import express from "express";
-import fetch from "node-fetch";
+import cors from "cors";
 
-const app  = express();
-const PORT = process.env.PORT || 3000;
-const BASE = "https://vidvault.to";
+const app = express();
+const PORT = process.env.SERVER_PORT || process.env.PORT || 3000;
 
+// Allow your site to fetch from this API
+app.use(cors());
+
+const START_URL = "https://mp4indir.mobi";
 const UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Mobile Safari/537.36";
 
-const VV_HEADERS = {
-  "User-Agent"     : UA,
-  "Accept"         : "application/json, */*",
-  "Referer"        : BASE + "/",
-  "Origin"         : BASE,
-  "sec-fetch-site" : "same-origin",
-  "sec-fetch-mode" : "cors",
-  "sec-fetch-dest" : "empty",
-};
-
-const QUALITIES = ["1080p", "720p", "480p", "360p"];
-
-// ── CORS ──────────────────────────────────────────────────────────────────────
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin",  process.env.ALLOW_ORIGIN || "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-API-Key, Authorization");
-  if (req.method === "OPTIONS") return res.sendStatus(204);
-  next();
-});
-
-// ── optional API key guard ─────────────────────────────────────────────────
-app.use((req, res, next) => {
-  if (!process.env.API_KEY) return next();
-  if (req.path === "/health") return next();
-  const key = req.headers["x-api-key"] ||
-              (req.headers["authorization"] || "").replace("Bearer ", "");
-  if (key !== process.env.API_KEY) {
-    return res.status(401).json({ ok: false, error: "unauthorized" });
+async function fetchWithDomain(path, opts = {}) {
+  const headers = { "User-Agent": UA, "Accept": "*/*", "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8", ...opts.headers };
+  let body;
+  if (opts.data) {
+    body = new URLSearchParams(opts.data).toString();
+    headers["Content-Type"] = "application/x-www-form-urlencoded";
   }
-  next();
-});
 
-// ── helper ────────────────────────────────────────────────────────────────────
-const fetchOne = async (type, id, season, episode, q) => {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 20000);
+  
   try {
-    let url = `${BASE}/download-link/${encodeURIComponent(type)}/${encodeURIComponent(id)}`;
-    if (type === "tv" && season && episode) {
-      url += `/${encodeURIComponent(season)}/${encodeURIComponent(episode)}`;
-    }
-    url += `/${encodeURIComponent(q)}`;
-
-    const r    = await fetch(url, { headers: VV_HEADERS, timeout: 25000 });
-    const data = await r.json().catch(() => ({}));
-    if (!r.ok || !data.url) return null;
-
-    const raw   = String(data.url);
-    const clean = raw.split("?")[0].split("#")[0];
-    return {
-      quality : q,
-      url     : clean.endsWith(".mkv") ? clean : clean + ".mkv",
-    };
-  } catch {
-    return null;
-  }
-};
-
-// ── GET /links ─────────────────────────────────────────────────────────────────
-// ?type=movie&id=969681
-// ?type=tv&id=108978&season=1&episode=1
-// ?type=movie&id=969681&quality=720p
-app.get("/links", async (req, res) => {
-  const { type, id, season, episode, quality } = req.query;
-
-  if (!type || !id) {
-    return res.status(400).json({ ok: false, error: "type and id are required" });
-  }
-  if (!["movie", "tv"].includes(type)) {
-    return res.status(400).json({ ok: false, error: "type must be movie or tv" });
-  }
-
-  try {
-    if (quality) {
-      const r = await fetchOne(type, id, season, episode, quality);
-      if (!r) return res.status(404).json({ ok: false, error: "quality not available" });
-      return res.json({ ok: true, ...r });
+    let baseUrl = START_URL;
+    if (!path.startsWith("http")) {
+      const baseResp = await fetch(START_URL, { headers, signal: ctrl.signal, redirect: "follow" });
+      const finalUrl = new URL(baseResp.url);
+      baseUrl = `${finalUrl.protocol}//${finalUrl.host}`;
+    } else {
+      baseUrl = ""; 
     }
 
-    const results = (
-      await Promise.all(QUALITIES.map(q => fetchOne(type, id, season, episode, q)))
-    ).filter(Boolean);
-
-    res.json({ ok: true, count: results.length, links: results });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
+    const targetUrl = path.startsWith("http") ? path : baseUrl + path;
+    const resp = await fetch(targetUrl, { method: opts.method || "GET", headers, body, signal: ctrl.signal, redirect: "follow" });
+    const text = await resp.text();
+    return { text, status: resp.status, final: resp.url, baseUrl };
+  } finally {
+    clearTimeout(t);
   }
-});
+}
 
-// ── GET /proxy ─────────────────────────────────────────────────────────────────
-// ?url=ENCODED_WORKER_URL&filename=movie.mkv
-// pipes the MKV through this server so browser download works without Referer header
-app.get("/proxy", async (req, res) => {
-  const { url, filename } = req.query;
-  if (!url) return res.status(400).json({ ok: false, error: "url required" });
+// Clean the title for the file name
+function cleanFileName(title, quality, episode) {
+  let parts = title.split(" ");
+  let shortTitle = parts.slice(0, 4).join(" ");
+  shortTitle = shortTitle.replace(/[^\w\s\-]/gi, "").trim().replace(/\s+/g, "_");
+  
+  let epStr = "";
+  if (episode && episode !== "file") {
+    const epMatch = episode.match(/Episodes?:\s*(\d+)/i) || episode.match(/(\d+)/);
+    if (epMatch) epStr = `_E${epMatch[1]}`;
+    else epStr = `_${episode.replace(/[^\w]/g, "")}`;
+  }
+  return `${shortTitle}_${quality}${epStr}.mkv`;
+}
 
-  let decoded;
-  try { decoded = decodeURIComponent(url); }
-  catch { return res.status(400).json({ ok: false, error: "bad url encoding" }); }
+async function search(query) {
+  const data = { do: "search", subaction: "search", story: query };
+  const { text, status, baseUrl } = await fetchWithDomain("/", { method: "POST", data, headers: { Referer: START_URL + "/" } });
+  if (status !== 200) throw new Error(`search status ${status}`);
+  
+  const items = [];
+  const re = /<li>\s*<a\s+href="(https?:\/\/[^"]+\.html)"[^>]*>([\s\S]*?)<\/a>\s*<\/li>/gi;
+  let m;
+  while ((m = re.exec(text))) {
+    const url = m[1], block = m[2];
+    const tm = block.match(/<p>\s*([\s\S]*?)\s*(?:<font|<\/p>)/i);
+    const title = tm ? tm[1].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim() : "?";
+    if (title && !items.find((x) => x.url === url)) items.push({ title, url });
+  }
+  return { results: items, baseUrl };
+}
 
-  // only proxy vidvault worker URLs — safety gate
-  if (!decoded.includes("workers.dev") && !decoded.includes("vidvault.to")) {
-    return res.status(403).json({ ok: false, error: "not allowed" });
+async function getQualities(pageUrl) {
+  const { text, status } = await fetchWithDomain(pageUrl);
+  if (status !== 200) throw new Error(`page status ${status}`);
+  const out = [];
+  const re = /<a[^>]+class="btn"[^>]+href="(https?:\/\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+  let m;
+  while ((m = re.exec(text))) {
+    const href = m[1];
+    const label = m[2].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+    if (!href.includes("nexdrive")) continue;
+    const q = label.match(/(\d{3,4}p)/i);
+    const s = label.match(/\[(\d+(?:\.\d+)?\s*(?:MB|GB))\]/i);
+    out.push({ quality: q ? q[1] : "??", size: s ? s[1].replace(/\s+/g, "") : "?", label, nexdrive: href });
+  }
+  return out;
+}
+
+async function getEpisodes(nexdriveUrl, baseUrl) {
+  const { text, status } = await fetchWithDomain(nexdriveUrl, { headers: { Referer: baseUrl + "/" } });
+  if (status !== 200) throw new Error(`nexdrive status ${status}`);
+  
+  const collect = (block) => {
+    const links = [];
+    const re = /<a[^>]+class="download ([^"]*)"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+    let m;
+    while ((m = re.exec(block))) {
+      const href = m[2];
+      const label = m[3].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+      let kind;
+      if (href.includes("fast-dl.one")) kind = "gdirect";
+      else if (href.includes("vgmlinks")) kind = "vcloud";
+      else continue;
+      links.push({ kind, url: href, label });
+    }
+    return links;
+  };
+
+  const eps = [];
+  const secRe = /<section class="episode">([\s\S]*?)<\/section>/gi;
+  let s;
+  while ((s = secRe.exec(text))) {
+    const block = s[1];
+    const em = block.match(/class="ep-title"[^>]*>([\s\S]*?)<\/h2>/i);
+    const ep = em ? em[1].replace(/<[^>]+>/g, "").trim() : "?";
+    const links = collect(block);
+    if (links.length) eps.push({ episode: ep, links });
+  }
+  if (!eps.length) {
+    const loose = collect(text);
+    if (loose.length) eps.push({ episode: "file", links: loose });
+  }
+  return eps;
+}
+
+async function resolveFastDl(fastUrl) {
+  const { text, final } = await fetchWithDomain(fastUrl, { headers: { Referer: "https://nexdrive.pics/" } });
+  const m = text.match(/<a[^>]+id="download-button"[^>]+href="([^"]+)"/i);
+  if (!m) throw new Error("no #download-button");
+  const href = m[1];
+  const baseDir = final.replace(/\/[^/]*$/, "/");
+  const dlUrl = new URL(href, baseDir).toString();
+  
+  const hash = crypto.randomUUID().replace(/-/g, "").slice(0, 24);
+  const cfs = crypto.randomUUID().replace(/-/g, "").slice(0, 16);
+  const prep = `${dlUrl}${dlUrl.includes("?") ? "&" : "?"}prepare=1&hash=${hash}&cfs=${cfs}`;
+  
+  const { text: jt } = await fetchWithDomain(prep, {
+    headers: { Referer: fastUrl, Accept: "application/json", "X-Requested-With": "XMLHttpRequest" },
+  });
+  let data;
+  try { data = JSON.parse(jt); } catch { throw new Error("non-json"); }
+  if (data.ok && data.url) return data.url;
+  throw new Error(data.error || "no url");
+}
+
+// ── ENDPOINT FOR YOUR SITE ─────────────────────────────────────────────────
+// Usage: GET /api?title=Reacher&type=movie
+// Usage: GET /api?title=Reacher&type=series
+app.get("/api", async (req, res) => {
+  const title = req.query.title;
+  const type = req.query.type || "movie"; // 'movie' or 'series'
+
+  if (!title) {
+    return res.status(400).json({ error: "Provide ?title=Movie Name" });
   }
 
   try {
-    const upstream = await fetch(decoded, {
-      headers: {
-        "User-Agent": UA,
-        "Referer"   : BASE + "/",
-        "Accept"    : "*/*",
-      },
+    // 1. Search for the title
+    const { results, baseUrl } = await search(title);
+    if (!results.length) {
+      return res.status(404).json({ error: "No results found for this title." });
+    }
+
+    // 2. Grab the first result (usually the most accurate)
+    const pageUrl = results[0].url;
+    
+    // 3. Get qualities
+    const qs = await getQualities(pageUrl);
+    if (!qs.length) {
+      return res.status(404).json({ error: "No download qualities found for this title." });
+    }
+
+    // 4. Get episodes/links
+    let jobs = [];
+    for (const qual of qs) {
+      let eps = await getEpisodes(qual.nexdrive, new URL(pageUrl).origin);
+      
+      // If looking for movie, only get the single file (ignore episodes)
+      if (type === "movie") {
+        eps = eps.filter(e => e.episode === "file" || e.links.length === 1);
+      }
+
+      for (const ep of eps) {
+        for (const ln of ep.links) {
+          if (ln.kind !== "gdirect") continue; // Only direct links
+          try {
+            const direct = await resolveFastDl(ln.url);
+            jobs.push({
+              quality: qual.quality,
+              size: qual.size,
+              episode: ep.episode,
+              direct_url: direct,
+              file_name: cleanFileName(title, qual.quality, ep.episode)
+            });
+          } catch (e) {
+            // Skip failed links to keep the UI clean
+          }
+        }
+      }
+    }
+
+    if (!jobs.length) {
+      return res.status(404).json({ error: "No direct links could be resolved." });
+    }
+
+    // 5. Return JSON for your site
+    res.json({
+      success: true,
+      title: results[0].title,
+      page_url: pageUrl,
+      type: type,
+      downloads: jobs
     });
 
-    if (!upstream.ok) {
-      return res.status(upstream.status).json({
-        ok    : false,
-        error : `upstream returned ${upstream.status}`,
-      });
-    }
-
-    const name = filename || "download.mkv";
-    res.setHeader("Content-Disposition", `attachment; filename="${name}"`);
-    res.setHeader("Content-Type", upstream.headers.get("content-type") || "video/x-matroska");
-
-    const cl = upstream.headers.get("content-length");
-    if (cl) res.setHeader("Content-Length", cl);
-
-    upstream.body.pipe(res);
-
-  } catch (err) {
-    if (!res.headersSent) {
-      res.status(500).json({ ok: false, error: err.message });
-    }
+  } catch (e) {
+    res.status(500).json({ error: String(e.message) });
   }
 });
 
-// ── GET /health ────────────────────────────────────────────────────────────────
-app.get("/health", (_, res) => res.json({ ok: true, ts: Date.now() }));
-
 app.listen(PORT, () => {
-  console.log(`vidvault-api running on :${PORT}`);
+  console.log(`Mp4Mania API running on port ${PORT}`);
 });
