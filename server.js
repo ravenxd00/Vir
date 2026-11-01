@@ -2,9 +2,8 @@ import express from "express";
 import cors from "cors";
 
 const app = express();
-const PORT = process.env.SERVER_PORT || process.env.PORT || 3000;
+const PORT = process.env.PORT || 3000;
 
-// Allow your site to fetch from this API
 app.use(cors());
 
 const START_URL = "https://mp4indir.mobi";
@@ -40,7 +39,6 @@ async function fetchWithDomain(path, opts = {}) {
   }
 }
 
-// Clean the title for the file name
 function cleanFileName(title, quality, episode) {
   let parts = title.split(" ");
   let shortTitle = parts.slice(0, 4).join(" ");
@@ -147,46 +145,37 @@ async function resolveFastDl(fastUrl) {
   throw new Error(data.error || "no url");
 }
 
-// ── ENDPOINT FOR YOUR SITE ─────────────────────────────────────────────────
-// Usage: GET /api?title=Reacher&type=movie
-// Usage: GET /api?title=Reacher&type=series
 app.get("/api", async (req, res) => {
   const title = req.query.title;
-  const type = req.query.type || "movie"; // 'movie' or 'series'
+  const type = req.query.type || "movie";
 
   if (!title) {
     return res.status(400).json({ error: "Provide ?title=Movie Name" });
   }
 
   try {
-    // 1. Search for the title
     const { results, baseUrl } = await search(title);
     if (!results.length) {
       return res.status(404).json({ error: "No results found for this title." });
     }
 
-    // 2. Grab the first result (usually the most accurate)
     const pageUrl = results[0].url;
-    
-    // 3. Get qualities
     const qs = await getQualities(pageUrl);
     if (!qs.length) {
       return res.status(404).json({ error: "No download qualities found for this title." });
     }
 
-    // 4. Get episodes/links
     let jobs = [];
     for (const qual of qs) {
       let eps = await getEpisodes(qual.nexdrive, new URL(pageUrl).origin);
       
-      // If looking for movie, only get the single file (ignore episodes)
       if (type === "movie") {
         eps = eps.filter(e => e.episode === "file" || e.links.length === 1);
       }
 
       for (const ep of eps) {
         for (const ln of ep.links) {
-          if (ln.kind !== "gdirect") continue; // Only direct links
+          if (ln.kind !== "gdirect") continue;
           try {
             const direct = await resolveFastDl(ln.url);
             jobs.push({
@@ -196,9 +185,7 @@ app.get("/api", async (req, res) => {
               direct_url: direct,
               file_name: cleanFileName(title, qual.quality, ep.episode)
             });
-          } catch (e) {
-            // Skip failed links to keep the UI clean
-          }
+          } catch (e) {}
         }
       }
     }
@@ -207,7 +194,6 @@ app.get("/api", async (req, res) => {
       return res.status(404).json({ error: "No direct links could be resolved." });
     }
 
-    // 5. Return JSON for your site
     res.json({
       success: true,
       title: results[0].title,
