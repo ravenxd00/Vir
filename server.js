@@ -1,13 +1,20 @@
 import express from "express";
 import cors from "cors";
+import { HttpsProxyAgent } from "https-proxy-agent";
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.SERVER_PORT || process.env.PORT || 3000;
 
 app.use(cors());
 
 const START_URL = "https://mp4indir.mobi";
 const UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Mobile Safari/537.36";
+
+// 🔴 YOUR PROXY HERE
+// Format: http://username:password@host:port
+// If they gave you a SOCKS5 proxy, change 'http://' to 'socks5://'
+const PROXY_URL = "http://2179:BGBVR1gdCCfG@p161.dsqproxy.com:80"; 
+const proxyAgent = new HttpsProxyAgent(PROXY_URL);
 
 async function fetchWithDomain(path, opts = {}) {
   const headers = { "User-Agent": UA, "Accept": "*/*", "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8", ...opts.headers };
@@ -18,12 +25,13 @@ async function fetchWithDomain(path, opts = {}) {
   }
 
   const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), 20000);
+  const t = setTimeout(() => ctrl.abort(), 25000);
   
   try {
     let baseUrl = START_URL;
     if (!path.startsWith("http")) {
-      const baseResp = await fetch(START_URL, { headers, signal: ctrl.signal, redirect: "follow" });
+      // 1. Resolve the new domain (via proxy)
+      const baseResp = await fetch(START_URL, { headers, signal: ctrl.signal, redirect: "follow", agent: proxyAgent });
       const finalUrl = new URL(baseResp.url);
       baseUrl = `${finalUrl.protocol}//${finalUrl.host}`;
     } else {
@@ -31,7 +39,17 @@ async function fetchWithDomain(path, opts = {}) {
     }
 
     const targetUrl = path.startsWith("http") ? path : baseUrl + path;
-    const resp = await fetch(targetUrl, { method: opts.method || "GET", headers, body, signal: ctrl.signal, redirect: "follow" });
+    
+    // 2. Fetch the actual page (via proxy)
+    const resp = await fetch(targetUrl, { 
+        method: opts.method || "GET", 
+        headers, 
+        body, 
+        signal: ctrl.signal, 
+        redirect: "follow",
+        agent: proxyAgent // <── Routing through your Indian residential proxy
+    });
+    
     const text = await resp.text();
     return { text, status: resp.status, final: resp.url, baseUrl };
   } finally {
@@ -208,5 +226,5 @@ app.get("/api", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Mp4Mania API running on port ${PORT}`);
+  console.log(`Mp4Mania API running on port ${PORT} with proxy`);
 });
