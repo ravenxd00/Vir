@@ -13,7 +13,7 @@ const UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like G
 
 // 🔴 YOUR RESIDENTIAL PROXY
 // If port 80 fails, try 8080 or 3128
-const PROXY_URL = "http://2179:BGBVR1gdCCfG@p161.dsqproxy.com:80"; 
+const PROXY_URL = "http://novada392mYY_89Kmcg-zone-res:WOA74qNB8RuT@04a4d43aaeddf180.xji.na.novada.pro:7777"; 
 const proxyAgent = new HttpsProxyAgent(PROXY_URL);
 
 // We use Axios here because it respects the proxy agent for both HTTP and HTTPS requests
