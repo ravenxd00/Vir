@@ -1,38 +1,42 @@
 import express from "express";
 import cors from "cors";
+import axios from "axios";
 import { HttpsProxyAgent } from "https-proxy-agent";
 
 const app = express();
-const PORT = process.env.SERVER_PORT || process.env.PORT || 3000;
+const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 
 const START_URL = "https://mp4indir.mobi";
 const UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Mobile Safari/537.36";
 
-// 🔴 YOUR PROXY HERE
-// Format: http://username:password@host:port
-// If they gave you a SOCKS5 proxy, change 'http://' to 'socks5://'
+// 🔴 YOUR RESIDENTIAL PROXY
+// If port 80 fails, try 8080 or 3128
 const PROXY_URL = "http://2179:BGBVR1gdCCfG@p161.dsqproxy.com:80"; 
 const proxyAgent = new HttpsProxyAgent(PROXY_URL);
 
+// We use Axios here because it respects the proxy agent for both HTTP and HTTPS requests
+const client = axios.create({
+  httpsAgent: proxyAgent,
+  httpAgent: proxyAgent,
+  timeout: 25000,
+});
+
 async function fetchWithDomain(path, opts = {}) {
   const headers = { "User-Agent": UA, "Accept": "*/*", "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8", ...opts.headers };
-  let body;
+  let data = null;
   if (opts.data) {
-    body = new URLSearchParams(opts.data).toString();
+    data = new URLSearchParams(opts.data).toString();
     headers["Content-Type"] = "application/x-www-form-urlencoded";
   }
 
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), 25000);
-  
   try {
     let baseUrl = START_URL;
     if (!path.startsWith("http")) {
-      // 1. Resolve the new domain (via proxy)
-      const baseResp = await fetch(START_URL, { headers, signal: ctrl.signal, redirect: "follow", agent: proxyAgent });
-      const finalUrl = new URL(baseResp.url);
+      // Resolve base domain using Axios through the proxy
+      const baseResp = await client.get(START_URL, { headers });
+      const finalUrl = new URL(baseResp.request.res.responseUrl || START_URL);
       baseUrl = `${finalUrl.protocol}//${finalUrl.host}`;
     } else {
       baseUrl = ""; 
@@ -40,20 +44,28 @@ async function fetchWithDomain(path, opts = {}) {
 
     const targetUrl = path.startsWith("http") ? path : baseUrl + path;
     
-    // 2. Fetch the actual page (via proxy)
-    const resp = await fetch(targetUrl, { 
-        method: opts.method || "GET", 
-        headers, 
-        body, 
-        signal: ctrl.signal, 
-        redirect: "follow",
-        agent: proxyAgent // <── Routing through your Indian residential proxy
+    const resp = await client({
+      method: opts.method || "GET",
+      url: targetUrl,
+      headers,
+      data,
+      maxRedirects: 5,
+      validateStatus: () => true // Don't throw on 403, handle it manually
     });
     
-    const text = await resp.text();
-    return { text, status: resp.status, final: resp.url, baseUrl };
-  } finally {
-    clearTimeout(t);
+    if (resp.status !== 200) {
+      console.log(`[!] Status ${resp.status} for ${targetUrl}`);
+    }
+    
+    return { 
+      text: typeof resp.data === "string" ? resp.data : JSON.stringify(resp.data), 
+      status: resp.status, 
+      final: resp.request.res.responseUrl || targetUrl, 
+      baseUrl 
+    };
+  } catch (err) {
+    console.error(`[!] Proxy Network Error: ${err.message}`);
+    throw new Error(`Proxy Error: ${err.message}`);
   }
 }
 
@@ -203,7 +215,9 @@ app.get("/api", async (req, res) => {
               direct_url: direct,
               file_name: cleanFileName(title, qual.quality, ep.episode)
             });
-          } catch (e) {}
+          } catch (e) {
+            console.log(`[!] FastDl Error: ${e.message}`);
+          }
         }
       }
     }
@@ -221,10 +235,11 @@ app.get("/api", async (req, res) => {
     });
 
   } catch (e) {
+    console.error(`[Server Error] ${e.message}`);
     res.status(500).json({ error: String(e.message) });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`Mp4Mania API running on port ${PORT} with proxy`);
+  console.log(`Mp4Mania API running on port ${PORT} with Residential Proxy`);
 });
