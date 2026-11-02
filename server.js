@@ -2,6 +2,8 @@ import express from "express";
 import cors from "cors";
 import axios from "axios";
 import { HttpsProxyAgent } from "https-proxy-agent";
+import { CookieJar } from "tough-cookie";
+import { wrapper } from "axios-cookiejar-support";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -11,20 +13,28 @@ app.use(cors());
 const START_URL = "https://mp4indir.mobi";
 const UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Mobile Safari/537.36";
 
-// 🔴 YOUR RESIDENTIAL PROXY
-// If port 80 fails, try 8080 or 3128
+// 🔴 YOUR HTTPS PROXY
 const PROXY_URL = "http://u_w38g3c:ucx1yx2157@proxies.toolz.ovh:8443"; 
 const proxyAgent = new HttpsProxyAgent(PROXY_URL);
 
-// We use Axios here because it respects the proxy agent for both HTTP and HTTPS requests
-const client = axios.create({
+// Initialize a client with a cookie jar (so it remembers PHPSESSID)
+const jar = new CookieJar();
+const client = wrapper(axios.create({
   httpsAgent: proxyAgent,
   httpAgent: proxyAgent,
+  jar,
   timeout: 25000,
-});
+}));
+
+let BASE_DOMAIN = START_URL;
 
 async function fetchWithDomain(path, opts = {}) {
-  const headers = { "User-Agent": UA, "Accept": "*/*", "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8", ...opts.headers };
+  const headers = { 
+    "User-Agent": UA, 
+    "Accept": "*/*", 
+    "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8",
+    ...opts.headers 
+  };
   let data = null;
   if (opts.data) {
     data = new URLSearchParams(opts.data).toString();
@@ -32,25 +42,28 @@ async function fetchWithDomain(path, opts = {}) {
   }
 
   try {
-    let baseUrl = START_URL;
-    if (!path.startsWith("http")) {
-      // Resolve base domain using Axios through the proxy
+    // 1. Resolve the live domain & get initial cookies
+    if (!path.startsWith("http") && !BASE_DOMAIN) {
       const baseResp = await client.get(START_URL, { headers });
       const finalUrl = new URL(baseResp.request.res.responseUrl || START_URL);
-      baseUrl = `${finalUrl.protocol}//${finalUrl.host}`;
-    } else {
-      baseUrl = ""; 
+      BASE_DOMAIN = `${finalUrl.protocol}//${finalUrl.host}`;
     }
 
-    const targetUrl = path.startsWith("http") ? path : baseUrl + path;
+    const targetUrl = path.startsWith("http") ? path : BASE_DOMAIN + path;
     
+    // 2. Ensure Referer matches the exact domain being hit
+    if (targetUrl.includes(BASE_DOMAIN)) {
+        headers["Referer"] = BASE_DOMAIN + "/";
+        headers["Origin"] = BASE_DOMAIN;
+    }
+
     const resp = await client({
       method: opts.method || "GET",
       url: targetUrl,
       headers,
       data,
       maxRedirects: 5,
-      validateStatus: () => true // Don't throw on 403, handle it manually
+      validateStatus: () => true
     });
     
     if (resp.status !== 200) {
@@ -61,7 +74,7 @@ async function fetchWithDomain(path, opts = {}) {
       text: typeof resp.data === "string" ? resp.data : JSON.stringify(resp.data), 
       status: resp.status, 
       final: resp.request.res.responseUrl || targetUrl, 
-      baseUrl 
+      baseUrl: BASE_DOMAIN 
     };
   } catch (err) {
     console.error(`[!] Proxy Network Error: ${err.message}`);
@@ -84,8 +97,16 @@ function cleanFileName(title, quality, episode) {
 }
 
 async function search(query) {
+  // First hit homepage to get cookies
+  await fetchWithDomain("/");
+
   const data = { do: "search", subaction: "search", story: query };
-  const { text, status, baseUrl } = await fetchWithDomain("/", { method: "POST", data, headers: { Referer: START_URL + "/" } });
+  const { text, status, baseUrl } = await fetchWithDomain("/", { 
+      method: "POST", 
+      data, 
+      headers: { "Referer": BASE_DOMAIN + "/" } 
+  });
+  
   if (status !== 200) throw new Error(`search status ${status}`);
   
   const items = [];
@@ -241,5 +262,5 @@ app.get("/api", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Mp4Mania API running on port ${PORT} with Residential Proxy`);
+  console.log(`Mp4Mania API running on port ${PORT} with HTTPS Proxy`);
 });
