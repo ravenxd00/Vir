@@ -2,8 +2,6 @@ import express from "express";
 import cors from "cors";
 import axios from "axios";
 import { HttpsProxyAgent } from "https-proxy-agent";
-import { CookieJar } from "tough-cookie";
-import { wrapper } from "axios-cookiejar-support";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -17,16 +15,15 @@ const UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like G
 const PROXY_URL = "http://u_w38g3c:ucx1yx2157@proxies.toolz.ovh:8443"; 
 const proxyAgent = new HttpsProxyAgent(PROXY_URL);
 
-// Initialize a client with a cookie jar (so it remembers PHPSESSID)
-const jar = new CookieJar();
-const client = wrapper(axios.create({
+const client = axios.create({
   httpsAgent: proxyAgent,
   httpAgent: proxyAgent,
-  jar,
   timeout: 25000,
-}));
+});
 
+// Global state to store the current domain and cookies
 let BASE_DOMAIN = START_URL;
+let COOKIES = "";
 
 async function fetchWithDomain(path, opts = {}) {
   const headers = { 
@@ -35,6 +32,12 @@ async function fetchWithDomain(path, opts = {}) {
     "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8",
     ...opts.headers 
   };
+  
+  // Attach cookies if we have them
+  if (COOKIES) {
+      headers["Cookie"] = COOKIES;
+  }
+
   let data = null;
   if (opts.data) {
     data = new URLSearchParams(opts.data).toString();
@@ -42,20 +45,11 @@ async function fetchWithDomain(path, opts = {}) {
   }
 
   try {
-    // 1. Resolve the live domain & get initial cookies
-    if (!path.startsWith("http") && !BASE_DOMAIN) {
-      const baseResp = await client.get(START_URL, { headers });
-      const finalUrl = new URL(baseResp.request.res.responseUrl || START_URL);
-      BASE_DOMAIN = `${finalUrl.protocol}//${finalUrl.host}`;
-    }
-
     const targetUrl = path.startsWith("http") ? path : BASE_DOMAIN + path;
     
-    // 2. Ensure Referer matches the exact domain being hit
-    if (targetUrl.includes(BASE_DOMAIN)) {
-        headers["Referer"] = BASE_DOMAIN + "/";
-        headers["Origin"] = BASE_DOMAIN;
-    }
+    // Set Referer/Origin based on the current domain
+    headers["Referer"] = BASE_DOMAIN + "/";
+    headers["Origin"] = BASE_DOMAIN;
 
     const resp = await client({
       method: opts.method || "GET",
@@ -65,6 +59,21 @@ async function fetchWithDomain(path, opts = {}) {
       maxRedirects: 5,
       validateStatus: () => true
     });
+    
+    // Save cookies from the response
+    if (resp.headers["set-cookie"]) {
+        COOKIES = resp.headers["set-cookie"].map(c => c.split(";")[0]).join("; ");
+    }
+
+    // Handle redirects manually to update the base domain
+    if (resp.request.res.responseUrl) {
+        const finalUrl = new URL(resp.request.res.responseUrl);
+        const newBase = `${finalUrl.protocol}//${finalUrl.host}`;
+        if (newBase !== BASE_DOMAIN) {
+            BASE_DOMAIN = newBase;
+            console.log(`[!] Domain updated to: ${BASE_DOMAIN}`);
+        }
+    }
     
     if (resp.status !== 200) {
       console.log(`[!] Status ${resp.status} for ${targetUrl}`);
@@ -97,14 +106,13 @@ function cleanFileName(title, quality, episode) {
 }
 
 async function search(query) {
-  // First hit homepage to get cookies
+  // First hit homepage to get cookies (and update domain)
   await fetchWithDomain("/");
 
   const data = { do: "search", subaction: "search", story: query };
   const { text, status, baseUrl } = await fetchWithDomain("/", { 
       method: "POST", 
-      data, 
-      headers: { "Referer": BASE_DOMAIN + "/" } 
+      data
   });
   
   if (status !== 200) throw new Error(`search status ${status}`);
