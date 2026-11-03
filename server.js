@@ -121,11 +121,10 @@ async function mdSearch(q, page = 1) {
 }
 
 // ───────────────────────── post scrape ─────────────────────────
-// Buckets:
-//   hubcloud  → anything that is a per-quality download link (mdrive.lol OR hubcloud.ist)
-//   gdflix    → gdflix.vip links
-//   other     → any other external
-// We bucket by LABEL first (quality/mode), then by href host if label isn't clear.
+// Buckets by LABEL first (quality/mode), then by href host.
+//   hubcloud → quality-labelled download anchors (mdrive.lol OR hubcloud.ist)
+//   gdflix   → gdflix.vip links
+//   other    → everything else external
 async function mdPostLinks(permalink) {
   const url = permalink.startsWith("http")
     ? permalink
@@ -143,7 +142,6 @@ async function mdPostLinks(permalink) {
   const $ = cheerio.load(doc);
   const groups = { hubcloud: [], gdflix: [], other: [] };
 
-  // "720p Single Episode", "1080p Zip [10.6GB]", "4K 2160p Single Episode", etc.
   const dlLabelRe = /(\d{3,4}p|4k|2160p).*(single|zip|episode)/i;
 
   $("a").each((_, el) => {
@@ -180,7 +178,6 @@ async function mdResolve(startUrl) {
   const steps = [];
   let hubcloudUrl = startUrl;
 
-  // Hop 1 — mdrive.lol/archive/<id>  →  find hubcloud.ist link inside
   if (startUrl.includes("mdrive.lol")) {
     const { data: rawMd, request: reqMd } = await http.get(startUrl);
     steps.push({ step: "mdrive", url: reqMd.res.responseUrl || startUrl });
@@ -200,7 +197,6 @@ async function mdResolve(startUrl) {
     }
     hubcloudUrl = hcMatch[1].replace(/\\\//g, "/");
 
-    // If mdrive gave us a gamerxyt URL directly, skip hubcloud page hop
     if (hubcloudUrl.includes("gamerxyt")) {
       return await finishGenerator(hubcloudUrl, steps, key);
     }
@@ -215,7 +211,6 @@ async function mdResolve(startUrl) {
 
   steps.push({ step: "hubcloud_link", url: hubcloudUrl });
 
-  // Hop 2 — hubcloud share page → find generator url
   const { data: raw2, request: req2 } = await http.get(hubcloudUrl);
   steps.push({ step: "hubcloud_page", url: req2.res.responseUrl || hubcloudUrl });
   const doc2 = unescapeHtml(raw2);
@@ -293,8 +288,19 @@ function pickPost(results, year, season) {
   return results[0] || null;
 }
 
-function pickHubcloud(links, quality, mode, season, episode) {
+// Series → zip only. Movies → single file only. Hard filter, then rank.
+// `episode` is only used for tiebreaking if the label ever mentions it,
+// but for series we don't serve per-episode links, so it mostly doesn't matter.
+function pickHubcloud(links, quality, season, episode, isSeries) {
   if (!links.length) return null;
+
+  const pool = links.filter((ln) => {
+    const label = ln.label.toLowerCase();
+    const isZip = label.includes("zip");
+    return isSeries ? isZip : !isZip;
+  });
+
+  if (!pool.length) return null;
 
   function score(ln) {
     const label = ln.label.toLowerCase();
@@ -309,25 +315,27 @@ function pickHubcloud(links, quality, mode, season, episode) {
       else if (labelQs.some((x) => x === "1080" || x === "2160")) s += 3;
     }
 
-    const isZip = label.includes("zip");
-    if (mode === "zip" && isZip) s += 20;
-    else if (mode === "single" && !isZip) s += 20;
-
     if (season && label.includes(`season ${season}`)) s += 5;
-    if (episode) {
-      const ep = String(parseInt(episode, 10)).padStart(2, "0");
-      if (label.includes(`ep${ep}`) || label.includes(`episode ${ep}`)) s += 5;
+
+    // For series zips, prefer larger zips when quality ties (heuristic: bigger = better encode)
+    const sizeMatch = label.match(/\[([\d.]+)\s*(gb|mb)\]/i);
+    if (sizeMatch) {
+      const num = parseFloat(sizeMatch[1]);
+      const unit = sizeMatch[2].toLowerCase();
+      const gb = unit === "gb" ? num : num / 1024;
+      s += Math.min(gb, 50) / 100; // tiny nudge, keeps quality/season dominant
     }
+
     return s;
   }
 
-  return [...links].sort((a, b) => score(b) - score(a))[0];
+  return [...pool].sort((a, b) => score(b) - score(a))[0];
 }
 
 // ───────────────────────── express app ─────────────────────────
 const app = express();
 
-app.get("/health", (_req, res) => res.json({ ok: true, version: "3.1.0" }));
+app.get("/health", (_req, res) => res.json({ ok: true, version: "3.2.0" }));
 
 app.get("/search", async (req, res) => {
   try {
@@ -370,12 +378,11 @@ app.get("/resolve", async (req, res) => {
 
 app.get("/download", async (req, res) => {
   try {
-    const { title, year, season, episode, quality, mode = "single" } = req.query;
+    const { title, year, season, episode, quality } = req.query;
 
     if (!title) return res.status(400).json({ error: "title required" });
-    if (mode !== "single" && mode !== "zip") {
-      return res.status(400).json({ error: "mode must be single or zip" });
-    }
+
+    const isSeries = !!season;
 
     const q = year ? `${title} ${year}` : title;
     const searchRes = await mdSearch(q);
@@ -384,26 +391,43 @@ app.get("/download", async (req, res) => {
     }
 
     const postHit = pickPost(searchRes.results, year, season);
-    if (!postHit) return res.status(404).json({ error: "no post matched filters" });
+    if (!postHit) {
+      return res.status(404).json({ error: "no post matched filters" });
+    }
 
     const post = await mdPostLinks(postHit.permalink);
     const hubcloud = post.links.hubcloud;
     if (!hubcloud.length) {
       return res.status(404).json({
-        error: "no hubcloud links",
+        error: "no download links on post",
         post: { title: post.title, url: post.url },
         gdflix: post.links.gdflix,
         all_labels_seen: post.links.other.map((o) => o.label),
       });
     }
 
-    const chosen = pickHubcloud(hubcloud, quality, mode, season, episode);
-    if (!chosen) return res.status(404).json({ error: "no link matched" });
+    const chosen = pickHubcloud(hubcloud, quality, season, episode, isSeries);
+    if (!chosen) {
+      return res.status(404).json({
+        error: isSeries
+          ? `no whole-season zip available${quality ? ` at ${quality}p` : ""}`
+          : `no single-file link available${quality ? ` at ${quality}p` : ""}`,
+        type: isSeries ? "series" : "movie",
+        all_hubcloud_labels: hubcloud.map((ln) => ln.label),
+      });
+    }
 
     const resolved = await mdResolve(chosen.url);
 
     res.json({
-      query: { title, year, season, episode, quality, mode },
+      query: {
+        title,
+        year,
+        season,
+        episode,
+        quality,
+        type: isSeries ? "series" : "movie",
+      },
       post: { title: post.title, url: post.url },
       chosen_link: chosen,
       file_name: resolved.file_name,
