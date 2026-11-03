@@ -65,24 +65,20 @@ function buildAndroidIntent(r2Url, mime = "application/x-z") {
   return `intent://${host}#Intent;scheme=https;action=android.intent.action.VIEW;type=${mime};S.browser_fallback_url=${fallback};end`;
 }
 
-// ───────────────────────── Parsing helpers ─────────────────────────
-function extractQuality(label) {
-  const m = label.match(/\b(480p|720p|1080p|2160p|4K)\b/i);
+function extractQuality(text) {
+  if (!text) return null;
+  const m = text.match(/\b(480p|720p|1080p|2160p|4K)\b/i);
   if (!m) return null;
   const raw = m[1].toLowerCase();
   return raw === "4k" ? "2160" : raw.replace("p", "");
 }
 
-function extractSizeGb(label) {
-  const m = label.match(/\[([\d.]+)\s*(gb|mb)\]/i);
+function extractSizeGb(text) {
+  if (!text) return null;
+  const m = text.match(/\[([\d.]+)\s*(gb|mb)\]/i);
   if (!m) return null;
   const num = parseFloat(m[1]);
   return m[2].toLowerCase() === "gb" ? num : num / 1024;
-}
-
-function extractSeasonFromLabel(label) {
-  const m = label.match(/season\s*(\d+)/i);
-  return m ? m[1] : null;
 }
 
 // ───────────────────────── Search ─────────────────────────
@@ -106,7 +102,7 @@ async function mdSearch(q, page = 1) {
   return cacheSet(key, { found: data.found || 0, results: hits });
 }
 
-// ───────────────────────── Post Scrape ─────────────────────────
+// ───────────────────────── Post Scrape (Context-Aware) ─────────────────────────
 async function mdPostLinks(permalink) {
   const url = permalink.startsWith("http") ? permalink : new URL(permalink, BASE).toString();
   const key = `post:${url}`;
@@ -115,50 +111,62 @@ async function mdPostLinks(permalink) {
 
   const { data: raw } = await http.get(url);
   const doc = unescapeHtml(raw);
+  const $ = cheerio.load(doc);
 
   const titleMatch = doc.match(/<h1 class="post-title">([^<]+)<\/h1>/);
   const title = titleMatch ? titleMatch[1].trim() : null;
 
-  const $ = cheerio.load(doc);
   const options = [];
-  const gdflix = [];
+  
+  // Scan the body sequentially to inherit context (Season & Quality from headers)
+  let currentSeason = null;
+  let currentQuality = null;
 
-  // Scan all anchor tags
-  $("a").each((_, el) => {
+  $("body").find("h1, h2, h3, h4, h5, h6, p, div, a").each((_, el) => {
+    const tag = el.tagName.toLowerCase();
+    const text = $(el).text().replace(/\s+/g, " ").trim();
+    if (!text) return;
+
+    // 1. Check if this element is a header that gives us new context
+    if (tag !== "a") {
+      // Look for Season number
+      const seasonMatch = text.match(/Season\s+(\d+)/i);
+      if (seasonMatch) currentSeason = seasonMatch[1];
+
+      // Look for Quality
+      const qMatch = extractQuality(text);
+      if (qMatch) currentQuality = qMatch;
+      
+      return; // headers aren't links, skip to next
+    }
+
+    // 2. If it's an anchor, process the link
     const href = $(el).attr("href");
-    const label = $(el).text().replace(/\s+/g, " ").trim();
-    if (!href || !label || !href.startsWith("http")) return;
-
-    if (href.includes("gdflix")) {
-      gdflix.push({ label, url: href });
+    if (!href || !href.startsWith("http")) return;
+    if (!href.includes("mdrive.lol") && !href.includes("hubcloud")) return;
+    
+    const lower = text.toLowerCase();
+    
+    // Check if it's a download button (Zip or Episode)
+    if (!lower.includes("zip") && !lower.includes("episode") && !lower.match(/\d{3,4}p/)) {
       return;
     }
 
-    // Must be a download host
-    if (!href.includes("mdrive.lol") && !href.includes("hubcloud")) return;
-
-    const lower = label.toLowerCase();
+    // For buttons that say just "Zip [x GB]", inherit currentSeason & currentQuality
+    // For buttons that say "1080p Zip", override quality
+    const btnQuality = extractQuality(text) || currentQuality;
     
-    // Is it a zip? If label just says "Zip [2.4GB]", we need to check if it's really a zip.
-    // Movies use labels like "480p [463.77 MB]" (not zip, single file).
-    // Series use "Zip [2.4GB]" (zip) or "720p Single Episode" (single).
-    
-    let mode = "single";
-    if (lower.includes("zip")) mode = "zip";
-    else if (lower.includes("episode")) mode = "single";
-
-    // Add to options. Quality/size/season extracted.
     options.push({
-      label,
+      label: text,
       url: href,
-      quality: extractQuality(label),
-      mode,
-      size_gb: extractSizeGb(label),
-      season: extractSeasonFromLabel(label),
+      quality: btnQuality,
+      mode: lower.includes("zip") ? "zip" : "single",
+      size_gb: extractSizeGb(text),
+      season: currentSeason, // <-- Attached from the header above it!
     });
   });
 
-  return cacheSet(key, { title, url, options, gdflix });
+  return cacheSet(key, { title, url, options });
 }
 
 // ───────────────────────── Resolve ─────────────────────────
@@ -240,20 +248,10 @@ function seasonInPostTitle(title, season) {
   return raw.trim() === String(season);
 }
 
-function pickPost(results, year, season) {
-  for (const r of results) {
-    const t = r.title || "";
-    if (!yearMatch(t, year)) continue;
-    if (season && !seasonInPostTitle(t, season)) continue;
-    return r;
-  }
-  return results[0] || null;
-}
-
 // ───────────────────────── Express App ─────────────────────────
 const app = express();
 
-app.get("/health", (_req, res) => res.json({ ok: true, version: "4.1.0" }));
+app.get("/health", (_req, res) => res.json({ ok: true, version: "5.0.0" }));
 
 app.get("/search", async (req, res) => {
   try {
@@ -284,13 +282,13 @@ app.get("/search", async (req, res) => {
         if (isSeries) {
           // Series: zip only
           options = options.filter((o) => o.mode === "zip");
-          // if a specific season is requested, prefer options that mention that season
           if (season) {
+            // Filter strictly by the inherited season tag
             const withSeason = options.filter((o) => o.season === String(season));
             if (withSeason.length) options = withSeason;
           }
         } else {
-          // Movie: single only (no zip)
+          // Movie: ANY link works (if it has no zip, we want single)
           options = options.filter((o) => o.mode === "single");
         }
 
@@ -298,14 +296,24 @@ app.get("/search", async (req, res) => {
 
         if (!options.length) continue;
 
+        // Deduplicate by URL (since sequential scan might catch nested things)
+        const uniqueOptions = [];
+        const seenUrls = new Set();
+        for (const opt of options) {
+           if (!seenUrls.has(opt.url)) {
+               seenUrls.add(opt.url);
+               uniqueOptions.push(opt);
+           }
+        }
+
         // Sort biggest first
-        options.sort((a, b) => (b.size_gb || 0) - (a.size_gb || 0));
+        uniqueOptions.sort((a, b) => (b.size_gb || 0) - (a.size_gb || 0));
 
         results.push({
           title: post.title,
           permalink: post.url,
           type,
-          options,
+          options: uniqueOptions,
         });
       } catch (e) {
         continue;
