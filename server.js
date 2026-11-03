@@ -1,274 +1,376 @@
 import express from "express";
-import cors from "cors";
 import axios from "axios";
-import { HttpsProxyAgent } from "https-proxy-agent";
+import * as cheerio from "cheerio";
 
-const app = express();
-const PORT = process.env.PORT || 3000;
+const BASE = "https://new1.moviesdrive.cyou";
+const TYPESENSE = `${BASE}/search.php`;
+const CACHE_TTL = parseInt(process.env.CACHE_TTL_SECONDS || "900", 10) * 1000;
 
-app.use(cors());
+const UA =
+  "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 " +
+  "(KHTML, like Gecko) Chrome/155.0.0.0 Mobile Safari/537.36";
 
-const START_URL = "https://mp4indir.mobi";
-const UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Mobile Safari/537.36";
+const MD_HEADERS = {
+  "user-agent": UA,
+  accept: "*/*",
+  "accept-language": "en-GB,en-US;q=0.9,en;q=0.8",
+  referer: `${BASE}/search.html`,
+};
 
-// 🔴 YOUR HTTPS PROXY
-const PROXY_URL = "http://u_w38g3c:ucx1yx2157@proxies.toolz.ovh:8443"; 
-const proxyAgent = new HttpsProxyAgent(PROXY_URL);
-
-const client = axios.create({
-  httpsAgent: proxyAgent,
-  httpAgent: proxyAgent,
+const http = axios.create({
   timeout: 25000,
+  headers: MD_HEADERS,
+  maxRedirects: 10,
+  validateStatus: (s) => s >= 200 && s < 400,
 });
 
-// Global state to store the current domain and cookies
-let BASE_DOMAIN = START_URL;
-let COOKIES = "";
-
-async function fetchWithDomain(path, opts = {}) {
-  const headers = { 
-    "User-Agent": UA, 
-    "Accept": "*/*", 
-    "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8",
-    ...opts.headers 
-  };
-  
-  // Attach cookies if we have them
-  if (COOKIES) {
-      headers["Cookie"] = COOKIES;
+// ───────────────────────── tiny cache ─────────────────────────
+const CACHE = new Map();
+function cacheGet(key) {
+  const v = CACHE.get(key);
+  if (!v) return null;
+  if (Date.now() - v.t > CACHE_TTL) {
+    CACHE.delete(key);
+    return null;
   }
+  return v.v;
+}
+function cacheSet(key, val) {
+  CACHE.set(key, { v: val, t: Date.now() });
+  return val;
+}
 
-  let data = null;
-  if (opts.data) {
-    data = new URLSearchParams(opts.data).toString();
-    headers["Content-Type"] = "application/x-www-form-urlencoded";
-  }
+// ───────────────────────── helpers ─────────────────────────
+function unescapeHtml(s) {
+  return s
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#039;/g, "'");
+}
 
-  try {
-    const targetUrl = path.startsWith("http") ? path : BASE_DOMAIN + path;
-    
-    // Set Referer/Origin based on the current domain
-    headers["Referer"] = BASE_DOMAIN + "/";
-    headers["Origin"] = BASE_DOMAIN;
+function extractAnchorById(doc, id) {
+  // href before or after id, both orders
+  let m = doc.match(
+    new RegExp(
+      `<a\\b[^>]*\\bid\\s*=\\s*["']${id}["'][^>]*\\bhref\\s*=\\s*["']([^"']+)["']`,
+      "i"
+    )
+  );
+  if (m) return m[1];
+  m = doc.match(
+    new RegExp(
+      `<a\\b[^>]*\\bhref\\s*=\\s*["']([^"']+)["'][^>]*\\bid\\s*=\\s*["']${id}["']`,
+      "i"
+    )
+  );
+  return m ? m[1] : null;
+}
 
-    const resp = await client({
-      method: opts.method || "GET",
-      url: targetUrl,
-      headers,
-      data,
-      maxRedirects: 5,
-      validateStatus: () => true
-    });
-    
-    // Save cookies from the response
-    if (resp.headers["set-cookie"]) {
-        COOKIES = resp.headers["set-cookie"].map(c => c.split(";")[0]).join("; ");
-    }
+function extractR2Url(doc) {
+  const m = doc.match(
+    /https:\/\/[a-z0-9]+\.r2\.cloudflarestorage\.com\/hub2?\/[^\s"'<>]+/i
+  );
+  return m ? m[0] : null;
+}
 
-    // Handle redirects manually to update the base domain
-    if (resp.request.res.responseUrl) {
-        const finalUrl = new URL(resp.request.res.responseUrl);
-        const newBase = `${finalUrl.protocol}//${finalUrl.host}`;
-        if (newBase !== BASE_DOMAIN) {
-            BASE_DOMAIN = newBase;
-            console.log(`[!] Domain updated to: ${BASE_DOMAIN}`);
-        }
-    }
-    
-    if (resp.status !== 200) {
-      console.log(`[!] Status ${resp.status} for ${targetUrl}`);
-    }
-    
-    return { 
-      text: typeof resp.data === "string" ? resp.data : JSON.stringify(resp.data), 
-      status: resp.status, 
-      final: resp.request.res.responseUrl || targetUrl, 
-      baseUrl: BASE_DOMAIN 
+function extractPixeldrain(doc) {
+  let m = doc.match(/var\s+pxl\s*=\s*"([^"]+)"/);
+  if (m) return m[1];
+  m = doc.match(/https:\/\/pixeldrain\.dev\/u\/[A-Za-z0-9]+/);
+  return m ? m[0] : null;
+}
+
+function extractFilename(doc) {
+  let m = doc.match(/<div class="card-header[^"]*">\s*([^<]+?)\s*<\/div>/);
+  if (m) return m[1].trim();
+  m = doc.match(/filename%3D%22([^%"]+)%22/);
+  return m ? m[1] : null;
+}
+
+function buildAndroidIntent(r2Url, mime = "application/x-z") {
+  if (!r2Url) return "";
+  const host = r2Url.replace(/^https?:\/\//, "");
+  const fallback = encodeURIComponent(r2Url);
+  return (
+    `intent://${host}#Intent;scheme=https;` +
+    `action=android.intent.action.VIEW;type=${mime};` +
+    `S.browser_fallback_url=${fallback};end`
+  );
+}
+
+// ───────────────────────── pipeline ─────────────────────────
+async function mdSearch(q, page = 1) {
+  const key = `search:${q}:${page}`;
+  const cached = cacheGet(key);
+  if (cached) return cached;
+
+  const { data } = await http.get(TYPESENSE, { params: { q, page } });
+  const hits = (data.hits || []).map((h) => {
+    const d = h.document || {};
+    return {
+      title: d.post_title,
+      permalink: new URL(d.permalink || "", BASE).toString(),
+      id: d.id,
+      imdb_id: d.imdb_id,
+      date: d.post_date,
+      categories: d.category || [],
     };
-  } catch (err) {
-    console.error(`[!] Proxy Network Error: ${err.message}`);
-    throw new Error(`Proxy Error: ${err.message}`);
-  }
-}
-
-function cleanFileName(title, quality, episode) {
-  let parts = title.split(" ");
-  let shortTitle = parts.slice(0, 4).join(" ");
-  shortTitle = shortTitle.replace(/[^\w\s\-]/gi, "").trim().replace(/\s+/g, "_");
-  
-  let epStr = "";
-  if (episode && episode !== "file") {
-    const epMatch = episode.match(/Episodes?:\s*(\d+)/i) || episode.match(/(\d+)/);
-    if (epMatch) epStr = `_E${epMatch[1]}`;
-    else epStr = `_${episode.replace(/[^\w]/g, "")}`;
-  }
-  return `${shortTitle}_${quality}${epStr}.mkv`;
-}
-
-async function search(query) {
-  // First hit homepage to get cookies (and update domain)
-  await fetchWithDomain("/");
-
-  const data = { do: "search", subaction: "search", story: query };
-  const { text, status, baseUrl } = await fetchWithDomain("/", { 
-      method: "POST", 
-      data
   });
-  
-  if (status !== 200) throw new Error(`search status ${status}`);
-  
-  const items = [];
-  const re = /<li>\s*<a\s+href="(https?:\/\/[^"]+\.html)"[^>]*>([\s\S]*?)<\/a>\s*<\/li>/gi;
-  let m;
-  while ((m = re.exec(text))) {
-    const url = m[1], block = m[2];
-    const tm = block.match(/<p>\s*([\s\S]*?)\s*(?:<font|<\/p>)/i);
-    const title = tm ? tm[1].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim() : "?";
-    if (title && !items.find((x) => x.url === url)) items.push({ title, url });
-  }
-  return { results: items, baseUrl };
+  return cacheSet(key, { found: data.found || 0, results: hits });
 }
 
-async function getQualities(pageUrl) {
-  const { text, status } = await fetchWithDomain(pageUrl);
-  if (status !== 200) throw new Error(`page status ${status}`);
-  const out = [];
-  const re = /<a[^>]+class="btn"[^>]+href="(https?:\/\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
-  let m;
-  while ((m = re.exec(text))) {
-    const href = m[1];
-    const label = m[2].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
-    if (!href.includes("nexdrive")) continue;
-    const q = label.match(/(\d{3,4}p)/i);
-    const s = label.match(/\[(\d+(?:\.\d+)?\s*(?:MB|GB))\]/i);
-    out.push({ quality: q ? q[1] : "??", size: s ? s[1].replace(/\s+/g, "") : "?", label, nexdrive: href });
-  }
-  return out;
+async function mdPostLinks(permalink) {
+  const url = permalink.startsWith("http") ? permalink : new URL(permalink, BASE).toString();
+  const key = `post:${url}`;
+  const cached = cacheGet(key);
+  if (cached) return cached;
+
+  const { data: raw } = await http.get(url);
+  const doc = unescapeHtml(raw);
+
+  const titleMatch = doc.match(/<h1 class="post-title">([^<]+)<\/h1>/);
+  const title = titleMatch ? titleMatch[1].trim() : null;
+
+  const $ = cheerio.load(doc);
+  const groups = { mdrive: [], hubcloud: [], gdflix: [], other: [] };
+  $("a").each((_, el) => {
+    const href = $(el).attr("href");
+    const label = $(el).text().replace(/\s+/g, " ").trim();
+    if (!href || !label || !href.startsWith("http")) return;
+    const entry = { label, url: href };
+    if (href.includes("mdrive.lol")) groups.mdrive.push(entry);
+    else if (href.includes("hubcloud")) groups.hubcloud.push(entry);
+    else if (href.includes("gdflix")) groups.gdflix.push(entry);
+  });
+
+  return cacheSet(key, { title, url, links: groups });
 }
 
-async function getEpisodes(nexdriveUrl, baseUrl) {
-  const { text, status } = await fetchWithDomain(nexdriveUrl, { headers: { Referer: baseUrl + "/" } });
-  if (status !== 200) throw new Error(`nexdrive status ${status}`);
-  
-  const collect = (block) => {
-    const links = [];
-    const re = /<a[^>]+class="download ([^"]*)"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
-    let m;
-    while ((m = re.exec(block))) {
-      const href = m[2];
-      const label = m[3].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
-      let kind;
-      if (href.includes("fast-dl.one")) kind = "gdirect";
-      else if (href.includes("vgmlinks")) kind = "vcloud";
-      else continue;
-      links.push({ kind, url: href, label });
+async function mdHubcloudToDirect(hubcloudUrl) {
+  const key = `hc:${hubcloudUrl}`;
+  const cached = cacheGet(key);
+  if (cached) return cached;
+
+  const steps = [{ step: "hubcloud_link", url: hubcloudUrl }];
+
+  // 1 — hubcloud share page
+  const { data: raw2, request: req2 } = await http.get(hubcloudUrl);
+  steps.push({ step: "hubcloud_page", url: req2.res.responseUrl || hubcloudUrl });
+  const doc2 = unescapeHtml(raw2);
+
+  let genUrl =
+    (doc2.match(/var\s+url\s*=\s*['"](https?:\/\/[^'"]+)['"]/) || [])[1] || null;
+  if (!genUrl) genUrl = extractAnchorById(doc2, "download");
+  if (!genUrl) {
+    return cacheSet(key, {
+      steps,
+      error: "no generator url",
+      direct_links: [],
+      android_intent: "",
+    });
+  }
+  genUrl = genUrl.replace(/\\\//g, "/");
+  steps.push({ step: "generator", url: genUrl });
+
+  // 2 — gamerxyt generator
+  const { data: raw3, request: req3 } = await http.get(genUrl);
+  steps.push({ step: "gamerxyt", url: req3.res.responseUrl || genUrl });
+  const doc3 = unescapeHtml(raw3);
+
+  const fslUrl = extractAnchorById(doc3, "fsl") || extractR2Url(doc3);
+  const pxlUrl = extractPixeldrain(doc3);
+  const fname = extractFilename(doc3);
+  const android = fslUrl ? buildAndroidIntent(fslUrl) : "";
+
+  const direct = [];
+  if (fslUrl) direct.push({ type: "fsl_r2", url: fslUrl });
+  if (pxlUrl) direct.push({ type: "pixeldrain", url: pxlUrl });
+
+  return cacheSet(key, {
+    steps,
+    file_name: fname,
+    direct_links: direct,
+    android_intent: android,
+  });
+}
+
+// ───────────────────────── smart picking ─────────────────────────
+const QUALITY_RE = /\b(480p|720p|1080p|2160p|4K)\b/i;
+const SEASON_RE = /season\s*(\d+(?:\s*[–-]\s*\d+)?)/i;
+
+function yearMatch(title, year) {
+  if (!year) return true;
+  return String(year).includes(String(year)) && title.includes(String(year));
+}
+
+function seasonInPostTitle(title, season) {
+  if (!season) return true;
+  const m = title.match(SEASON_RE);
+  if (!m) return false;
+  const raw = m[1];
+  const rng = raw.match(/(\d+)\s*[–-]\s*(\d+)/);
+  if (rng) {
+    const lo = parseInt(rng[1], 10);
+    const hi = parseInt(rng[2], 10);
+    const s = parseInt(season, 10);
+    return s >= lo && s <= hi;
+  }
+  return raw.trim() === String(season);
+}
+
+function pickPost(results, year, season) {
+  for (const r of results) {
+    const t = r.title || "";
+    if (!yearMatch(t, year)) continue;
+    if (season && !seasonInPostTitle(t, season)) continue;
+    return r;
+  }
+  return results[0] || null;
+}
+
+function pickHubcloud(links, quality, mode, season, episode) {
+  if (!links.length) return null;
+
+  function score(ln) {
+    const label = ln.label.toLowerCase();
+    let s = 0;
+
+    if (quality) {
+      const q = quality.toLowerCase().replace("p", "").replace("4k", "2160");
+      const labelQs = (label.match(QUALITY_RE) || []).map((x) =>
+        x.toLowerCase().replace("p", "").replace("4k", "2160")
+      );
+      if (labelQs.includes(q)) s += 10;
+      else if (labelQs.some((x) => x === "1080" || x === "2160")) s += 3;
     }
-    return links;
-  };
 
-  const eps = [];
-  const secRe = /<section class="episode">([\s\S]*?)<\/section>/gi;
-  let s;
-  while ((s = secRe.exec(text))) {
-    const block = s[1];
-    const em = block.match(/class="ep-title"[^>]*>([\s\S]*?)<\/h2>/i);
-    const ep = em ? em[1].replace(/<[^>]+>/g, "").trim() : "?";
-    const links = collect(block);
-    if (links.length) eps.push({ episode: ep, links });
+    const isZip = label.includes("zip");
+    if (mode === "zip" && isZip) s += 20;
+    else if (mode === "single" && !isZip) s += 20;
+
+    if (season && label.includes(`season ${season}`)) s += 5;
+    if (episode) {
+      const ep = String(parseInt(episode, 10)).padStart(2, "0");
+      if (label.includes(`ep${ep}`) || label.includes(`episode ${ep}`)) s += 5;
+    }
+    return s;
   }
-  if (!eps.length) {
-    const loose = collect(text);
-    if (loose.length) eps.push({ episode: "file", links: loose });
-  }
-  return eps;
+
+  return [...links].sort((a, b) => score(b) - score(a))[0];
 }
 
-async function resolveFastDl(fastUrl) {
-  const { text, final } = await fetchWithDomain(fastUrl, { headers: { Referer: "https://nexdrive.pics/" } });
-  const m = text.match(/<a[^>]+id="download-button"[^>]+href="([^"]+)"/i);
-  if (!m) throw new Error("no #download-button");
-  const href = m[1];
-  const baseDir = final.replace(/\/[^/]*$/, "/");
-  const dlUrl = new URL(href, baseDir).toString();
-  
-  const hash = crypto.randomUUID().replace(/-/g, "").slice(0, 24);
-  const cfs = crypto.randomUUID().replace(/-/g, "").slice(0, 16);
-  const prep = `${dlUrl}${dlUrl.includes("?") ? "&" : "?"}prepare=1&hash=${hash}&cfs=${cfs}`;
-  
-  const { text: jt } = await fetchWithDomain(prep, {
-    headers: { Referer: fastUrl, Accept: "application/json", "X-Requested-With": "XMLHttpRequest" },
-  });
-  let data;
-  try { data = JSON.parse(jt); } catch { throw new Error("non-json"); }
-  if (data.ok && data.url) return data.url;
-  throw new Error(data.error || "no url");
-}
+// ───────────────────────── express app ─────────────────────────
+const app = express();
 
-app.get("/api", async (req, res) => {
-  const title = req.query.title;
-  const type = req.query.type || "movie";
+app.get("/health", (_req, res) => res.json({ ok: true, version: "3.0.0" }));
 
-  if (!title) {
-    return res.status(400).json({ error: "Provide ?title=Movie Name" });
-  }
-
+app.get("/search", async (req, res) => {
   try {
-    const { results, baseUrl } = await search(title);
-    if (!results.length) {
-      return res.status(404).json({ error: "No results found for this title." });
+    const { q, year, page } = req.query;
+    if (!q) return res.status(400).json({ error: "q required" });
+    const out = await mdSearch(q, parseInt(page || "1", 10));
+    if (year) {
+      const filtered = out.results.filter((r) => yearMatch(r.title || "", year));
+      if (filtered.length) out.results = filtered;
+    }
+    res.json(out);
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
+app.get("/post", async (req, res) => {
+  try {
+    if (!req.query.url) return res.status(400).json({ error: "url required" });
+    res.json(await mdPostLinks(req.query.url));
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
+app.get("/resolve", async (req, res) => {
+  try {
+    const url = req.query.url;
+    if (!url) return res.status(400).json({ error: "url required" });
+
+    if (url.includes("hubcloud")) {
+      return res.json(await mdHubcloudToDirect(url));
+    }
+    if (url.includes("mdrive.lol")) {
+      const { data: raw, request } = await http.get(url);
+      const doc = unescapeHtml(raw);
+      const m = doc.match(/<a[^>]+href="(https?:\/\/[^"]*hubcloud[^"]*)"/i);
+      if (!m) return res.status(404).json({ error: "no hubcloud link on mdrive page" });
+      const inner = await mdHubcloudToDirect(m[1]);
+      inner.steps = [
+        { step: "mdrive", url: request.res.responseUrl || url },
+        ...(inner.steps || []),
+      ];
+      return res.json(inner);
+    }
+    return res.status(400).json({ error: "url must contain hubcloud or mdrive.lol" });
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
+app.get("/download", async (req, res) => {
+  try {
+    const {
+      title,
+      year,
+      season,
+      episode,
+      quality,
+      mode = "single",
+    } = req.query;
+
+    if (!title) return res.status(400).json({ error: "title required" });
+    if (mode !== "single" && mode !== "zip") {
+      return res.status(400).json({ error: "mode must be single or zip" });
     }
 
-    const pageUrl = results[0].url;
-    const qs = await getQualities(pageUrl);
-    if (!qs.length) {
-      return res.status(404).json({ error: "No download qualities found for this title." });
+    const q = year ? `${title} ${year}` : title;
+    const searchRes = await mdSearch(q);
+    if (!searchRes.results.length) {
+      return res.status(404).json({ error: `no results for '${q}'` });
     }
 
-    let jobs = [];
-    for (const qual of qs) {
-      let eps = await getEpisodes(qual.nexdrive, new URL(pageUrl).origin);
-      
-      if (type === "movie") {
-        eps = eps.filter(e => e.episode === "file" || e.links.length === 1);
-      }
+    const postHit = pickPost(searchRes.results, year, season);
+    if (!postHit) return res.status(404).json({ error: "no post matched filters" });
 
-      for (const ep of eps) {
-        for (const ln of ep.links) {
-          if (ln.kind !== "gdirect") continue;
-          try {
-            const direct = await resolveFastDl(ln.url);
-            jobs.push({
-              quality: qual.quality,
-              size: qual.size,
-              episode: ep.episode,
-              direct_url: direct,
-              file_name: cleanFileName(title, qual.quality, ep.episode)
-            });
-          } catch (e) {
-            console.log(`[!] FastDl Error: ${e.message}`);
-          }
-        }
-      }
+    const post = await mdPostLinks(postHit.permalink);
+    const hubcloud = post.links.hubcloud;
+    if (!hubcloud.length) {
+      return res.status(404).json({
+        error: "no hubcloud links",
+        post: { title: post.title, url: post.url },
+        gdflix: post.links.gdflix,
+      });
     }
 
-    if (!jobs.length) {
-      return res.status(404).json({ error: "No direct links could be resolved." });
-    }
+    const chosen = pickHubcloud(hubcloud, quality, mode, season, episode);
+    if (!chosen) return res.status(404).json({ error: "no link matched" });
+
+    const resolved = await mdHubcloudToDirect(chosen.url);
 
     res.json({
-      success: true,
-      title: results[0].title,
-      page_url: pageUrl,
-      type: type,
-      downloads: jobs
+      query: { title, year, season, episode, quality, mode },
+      post: { title: post.title, url: post.url },
+      chosen_link: chosen,
+      file_name: resolved.file_name,
+      direct_links: resolved.direct_links || [],
+      android_intent: resolved.android_intent || "",
+      all_hubcloud_labels: hubcloud.map((ln) => ln.label),
     });
-
   } catch (e) {
-    console.error(`[Server Error] ${e.message}`);
-    res.status(500).json({ error: String(e.message) });
+    res.status(502).json({ error: e.message });
   }
 });
 
+const PORT = process.env.PORT || 8000;
 app.listen(PORT, () => {
-  console.log(`Mp4Mania API running on port ${PORT} with HTTPS Proxy`);
+  console.log(`[moviesdrive-api] listening on :${PORT}`);
 });
