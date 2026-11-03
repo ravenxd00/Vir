@@ -51,7 +51,6 @@ function unescapeHtml(s) {
 }
 
 function extractAnchorById(doc, id) {
-  // href before or after id, both orders
   let m = doc.match(
     new RegExp(
       `<a\\b[^>]*\\bid\\s*=\\s*["']${id}["'][^>]*\\bhref\\s*=\\s*["']([^"']+)["']`,
@@ -100,7 +99,7 @@ function buildAndroidIntent(r2Url, mime = "application/x-z") {
   );
 }
 
-// ───────────────────────── pipeline ─────────────────────────
+// ───────────────────────── search ─────────────────────────
 async function mdSearch(q, page = 1) {
   const key = `search:${q}:${page}`;
   const cached = cacheGet(key);
@@ -121,8 +120,16 @@ async function mdSearch(q, page = 1) {
   return cacheSet(key, { found: data.found || 0, results: hits });
 }
 
+// ───────────────────────── post scrape ─────────────────────────
+// Buckets:
+//   hubcloud  → anything that is a per-quality download link (mdrive.lol OR hubcloud.ist)
+//   gdflix    → gdflix.vip links
+//   other     → any other external
+// We bucket by LABEL first (quality/mode), then by href host if label isn't clear.
 async function mdPostLinks(permalink) {
-  const url = permalink.startsWith("http") ? permalink : new URL(permalink, BASE).toString();
+  const url = permalink.startsWith("http")
+    ? permalink
+    : new URL(permalink, BASE).toString();
   const key = `post:${url}`;
   const cached = cacheGet(key);
   if (cached) return cached;
@@ -134,28 +141,81 @@ async function mdPostLinks(permalink) {
   const title = titleMatch ? titleMatch[1].trim() : null;
 
   const $ = cheerio.load(doc);
-  const groups = { mdrive: [], hubcloud: [], gdflix: [], other: [] };
+  const groups = { hubcloud: [], gdflix: [], other: [] };
+
+  // "720p Single Episode", "1080p Zip [10.6GB]", "4K 2160p Single Episode", etc.
+  const dlLabelRe = /(\d{3,4}p|4k|2160p).*(single|zip|episode)/i;
+
   $("a").each((_, el) => {
     const href = $(el).attr("href");
     const label = $(el).text().replace(/\s+/g, " ").trim();
     if (!href || !label || !href.startsWith("http")) return;
+
     const entry = { label, url: href };
-    if (href.includes("mdrive.lol")) groups.mdrive.push(entry);
-    else if (href.includes("hubcloud")) groups.hubcloud.push(entry);
-    else if (href.includes("gdflix")) groups.gdflix.push(entry);
+
+    if (href.includes("gdflix")) {
+      groups.gdflix.push(entry);
+      return;
+    }
+    if (dlLabelRe.test(label)) {
+      groups.hubcloud.push(entry);
+      return;
+    }
+    if (href.includes("hubcloud") || href.includes("mdrive.lol")) {
+      groups.hubcloud.push(entry);
+      return;
+    }
+    groups.other.push(entry);
   });
 
   return cacheSet(key, { title, url, links: groups });
 }
 
-async function mdHubcloudToDirect(hubcloudUrl) {
-  const key = `hc:${hubcloudUrl}`;
+// ───────────────────────── resolver (mdrive → hubcloud → gamerxyt) ─────────────────────────
+async function mdResolve(startUrl) {
+  const key = `hc:${startUrl}`;
   const cached = cacheGet(key);
   if (cached) return cached;
 
-  const steps = [{ step: "hubcloud_link", url: hubcloudUrl }];
+  const steps = [];
+  let hubcloudUrl = startUrl;
 
-  // 1 — hubcloud share page
+  // Hop 1 — mdrive.lol/archive/<id>  →  find hubcloud.ist link inside
+  if (startUrl.includes("mdrive.lol")) {
+    const { data: rawMd, request: reqMd } = await http.get(startUrl);
+    steps.push({ step: "mdrive", url: reqMd.res.responseUrl || startUrl });
+    const docMd = unescapeHtml(rawMd);
+
+    const hcMatch =
+      docMd.match(/<a[^>]+href="(https?:\/\/[^"]*hubcloud[^"]*)"[^>]*>/i) ||
+      docMd.match(/var\s+url\s*=\s*['"](https?:\/\/gamerxyt[^'"]+)['"]/i);
+
+    if (!hcMatch) {
+      return cacheSet(key, {
+        steps,
+        error: "no hubcloud link on mdrive page",
+        direct_links: [],
+        android_intent: "",
+      });
+    }
+    hubcloudUrl = hcMatch[1].replace(/\\\//g, "/");
+
+    // If mdrive gave us a gamerxyt URL directly, skip hubcloud page hop
+    if (hubcloudUrl.includes("gamerxyt")) {
+      return await finishGenerator(hubcloudUrl, steps, key);
+    }
+  } else if (!startUrl.includes("hubcloud")) {
+    return cacheSet(key, {
+      steps,
+      error: "url is not mdrive or hubcloud",
+      direct_links: [],
+      android_intent: "",
+    });
+  }
+
+  steps.push({ step: "hubcloud_link", url: hubcloudUrl });
+
+  // Hop 2 — hubcloud share page → find generator url
   const { data: raw2, request: req2 } = await http.get(hubcloudUrl);
   steps.push({ step: "hubcloud_page", url: req2.res.responseUrl || hubcloudUrl });
   const doc2 = unescapeHtml(raw2);
@@ -174,7 +234,10 @@ async function mdHubcloudToDirect(hubcloudUrl) {
   genUrl = genUrl.replace(/\\\//g, "/");
   steps.push({ step: "generator", url: genUrl });
 
-  // 2 — gamerxyt generator
+  return await finishGenerator(genUrl, steps, key);
+}
+
+async function finishGenerator(genUrl, steps, key) {
   const { data: raw3, request: req3 } = await http.get(genUrl);
   steps.push({ step: "gamerxyt", url: req3.res.responseUrl || genUrl });
   const doc3 = unescapeHtml(raw3);
@@ -202,7 +265,7 @@ const SEASON_RE = /season\s*(\d+(?:\s*[–-]\s*\d+)?)/i;
 
 function yearMatch(title, year) {
   if (!year) return true;
-  return String(year).includes(String(year)) && title.includes(String(year));
+  return title.includes(String(year));
 }
 
 function seasonInPostTitle(title, season) {
@@ -264,7 +327,7 @@ function pickHubcloud(links, quality, mode, season, episode) {
 // ───────────────────────── express app ─────────────────────────
 const app = express();
 
-app.get("/health", (_req, res) => res.json({ ok: true, version: "3.0.0" }));
+app.get("/health", (_req, res) => res.json({ ok: true, version: "3.1.0" }));
 
 app.get("/search", async (req, res) => {
   try {
@@ -294,23 +357,12 @@ app.get("/resolve", async (req, res) => {
   try {
     const url = req.query.url;
     if (!url) return res.status(400).json({ error: "url required" });
-
-    if (url.includes("hubcloud")) {
-      return res.json(await mdHubcloudToDirect(url));
+    if (!url.includes("hubcloud") && !url.includes("mdrive.lol")) {
+      return res
+        .status(400)
+        .json({ error: "url must contain hubcloud or mdrive.lol" });
     }
-    if (url.includes("mdrive.lol")) {
-      const { data: raw, request } = await http.get(url);
-      const doc = unescapeHtml(raw);
-      const m = doc.match(/<a[^>]+href="(https?:\/\/[^"]*hubcloud[^"]*)"/i);
-      if (!m) return res.status(404).json({ error: "no hubcloud link on mdrive page" });
-      const inner = await mdHubcloudToDirect(m[1]);
-      inner.steps = [
-        { step: "mdrive", url: request.res.responseUrl || url },
-        ...(inner.steps || []),
-      ];
-      return res.json(inner);
-    }
-    return res.status(400).json({ error: "url must contain hubcloud or mdrive.lol" });
+    res.json(await mdResolve(url));
   } catch (e) {
     res.status(502).json({ error: e.message });
   }
@@ -318,14 +370,7 @@ app.get("/resolve", async (req, res) => {
 
 app.get("/download", async (req, res) => {
   try {
-    const {
-      title,
-      year,
-      season,
-      episode,
-      quality,
-      mode = "single",
-    } = req.query;
+    const { title, year, season, episode, quality, mode = "single" } = req.query;
 
     if (!title) return res.status(400).json({ error: "title required" });
     if (mode !== "single" && mode !== "zip") {
@@ -348,13 +393,14 @@ app.get("/download", async (req, res) => {
         error: "no hubcloud links",
         post: { title: post.title, url: post.url },
         gdflix: post.links.gdflix,
+        all_labels_seen: post.links.other.map((o) => o.label),
       });
     }
 
     const chosen = pickHubcloud(hubcloud, quality, mode, season, episode);
     if (!chosen) return res.status(404).json({ error: "no link matched" });
 
-    const resolved = await mdHubcloudToDirect(chosen.url);
+    const resolved = await mdResolve(chosen.url);
 
     res.json({
       query: { title, year, season, episode, quality, mode },
@@ -364,6 +410,8 @@ app.get("/download", async (req, res) => {
       direct_links: resolved.direct_links || [],
       android_intent: resolved.android_intent || "",
       all_hubcloud_labels: hubcloud.map((ln) => ln.label),
+      steps: resolved.steps || [],
+      error: resolved.error || null,
     });
   } catch (e) {
     res.status(502).json({ error: e.message });
