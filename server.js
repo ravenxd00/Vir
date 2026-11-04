@@ -102,7 +102,7 @@ async function mdSearch(q, page = 1) {
   return cacheSet(key, { found: data.found || 0, results: hits });
 }
 
-// ───────────────────────── Post Scrape ─────────────────────────
+// ───────────────────────── Post Scrape & Folder Resolve ─────────────────────────
 async function mdPostLinks(permalink) {
   const url = permalink.startsWith("http") ? permalink : new URL(permalink, BASE).toString();
   const key = `post:${url}`;
@@ -115,10 +115,14 @@ async function mdPostLinks(permalink) {
 
   const titleMatch = doc.match(/<h1 class="post-title">([^<]+)<\/h1>/);
   const title = titleMatch ? titleMatch[1].trim() : null;
+  const isSeries = /season\s*\d+/i.test(title || "");
 
   const options = [];
   let currentSeason = null;
   let currentQuality = null;
+
+  // We collect links first, then resolve folder links in parallel
+  const rawLinks = [];
 
   $("body").find("h1, h2, h3, h4, h5, h6, p, div, a").each((_, el) => {
     const tag = el.tagName.toLowerCase();
@@ -126,8 +130,10 @@ async function mdPostLinks(permalink) {
     if (!text) return;
 
     if (tag !== "a") {
-      const seasonMatch = text.match(/Season\s+(\d+)/i);
-      if (seasonMatch) currentSeason = seasonMatch[1];
+      if (isSeries) {
+        const seasonMatch = text.match(/Season\s+(\d+)/i);
+        if (seasonMatch) currentSeason = seasonMatch[1];
+      }
       const qMatch = extractQuality(text);
       if (qMatch) currentQuality = qMatch;
       return;
@@ -135,8 +141,6 @@ async function mdPostLinks(permalink) {
 
     const href = $(el).attr("href");
     if (!href || !href.startsWith("http")) return;
-    
-    // Catch mdrive, standard hubcloud, AND search-recover links
     if (!href.includes("mdrive.lol") && !href.includes("hubcloud")) return;
     
     const lower = text.toLowerCase();
@@ -144,22 +148,70 @@ async function mdPostLinks(permalink) {
 
     const btnQuality = extractQuality(text) || currentQuality;
     
-    options.push({
+    rawLinks.push({
       label: text,
       url: href,
       quality: btnQuality,
       mode: lower.includes("zip") ? "zip" : "single",
       size_gb: extractSizeGb(text),
-      season: currentSeason,
+      season: isSeries ? currentSeason : null,
     });
   });
+
+  // Resolve search-recover pages to direct hubcloud links
+  for (const link of rawLinks) {
+    if (link.url.includes("search-recover.php")) {
+      try {
+        const urlObj = new URL(link.url);
+        const b64q = urlObj.searchParams.get("q");
+        let searchQuery = "";
+        if (b64q) searchQuery = Buffer.from(b64q, 'base64').toString('utf-8');
+        
+        const apiUrl = link.url.replace(/\/drive\/search-recover\.php.*/, "/drive/search-recover.php");
+        const fromAc = urlObj.searchParams.get("from_ac") || "";
+        
+        const { data: apiData } = await http.get(apiUrl, {
+          params: { api: 'search', q: searchQuery, page: 1, from_ac: fromAc }
+        });
+
+        if (apiData && apiData.hits && apiData.hits.length > 0) {
+          // Find the file that matches the label text or size
+          let bestFile = apiData.hits[0];
+          if (link.quality) {
+            const matched = apiData.hits.find(h => 
+              h.file_name.toLowerCase().includes(`${link.quality}p`) ||
+              (link.quality === "2160" && h.file_name.toLowerCase().includes("4k"))
+            );
+            if (matched) bestFile = matched;
+          } else if (link.size_gb) {
+            const matched = apiData.hits.find(h => {
+              const sizeStr = h.size.toLowerCase();
+              const matchGb = sizeStr.match(/([\d.]+)\s*(gb|mb)/i);
+              if (matchGb) {
+                const hSize = parseFloat(matchGb[1]) / (matchGb[2].toLowerCase() === 'mb' ? 1024 : 1);
+                return Math.abs(hSize - link.size_gb) < 0.1; // within 100MB
+              }
+              return false;
+            });
+            if (matched) bestFile = matched;
+          }
+          
+          // Replace the search-recover URL with the direct hubcloud drive URL
+          link.url = bestFile.url;
+        }
+      } catch (e) {
+        // If API fails, leave the search-recover URL (mdResolve will handle it as fallback)
+      }
+    }
+    options.push(link);
+  }
 
   return cacheSet(key, { title, url, options });
 }
 
 // ───────────────────────── Resolve ─────────────────────────
-async function mdResolve(startUrl, requestedQuality = null) {
-  const key = `hc:${startUrl}:${requestedQuality || 'any'}`;
+async function mdResolve(startUrl) {
+  const key = `hc:${startUrl}`;
   const cached = cacheGet(key);
   if (cached) return cached;
 
@@ -179,14 +231,12 @@ async function mdResolve(startUrl, requestedQuality = null) {
     targetUrl = hcMatch[1].replace(/\\\//g, "/");
   }
 
-  // Step 2: Handle the special "search-recover.php" folder page directly
+  // Step 2: Handle search-recover fallback (if it wasn't resolved in mdPostLinks)
   if (targetUrl.includes("search-recover.php")) {
     const urlObj = new URL(targetUrl);
     const b64q = urlObj.searchParams.get("q");
     let searchQuery = "";
-    if (b64q) {
-      try { searchQuery = Buffer.from(b64q, 'base64').toString('utf-8'); } catch(e){}
-    }
+    if (b64q) searchQuery = Buffer.from(b64q, 'base64').toString('utf-8');
     
     const apiUrl = targetUrl.replace(/\/drive\/search-recover\.php.*/, "/drive/search-recover.php");
     const fromAc = urlObj.searchParams.get("from_ac") || "";
@@ -196,17 +246,7 @@ async function mdResolve(startUrl, requestedQuality = null) {
     });
 
     if (apiData && apiData.hits && apiData.hits.length > 0) {
-      // Pick the file that matches the requested quality, fallback to highest quality
-      let bestFile = apiData.hits[0];
-      if (requestedQuality) {
-        const matchedFile = apiData.hits.find(h => 
-          h.file_name.toLowerCase().includes(`${requestedQuality}p`) ||
-          (requestedQuality === "2160" && h.file_name.toLowerCase().includes("4k"))
-        );
-        if (matchedFile) bestFile = matchedFile;
-      }
-
-      targetUrl = bestFile.url; // This will be like https://hubcloud.cx/drive/oht0lt070ottjmc
+      targetUrl = apiData.hits[0].url;
       steps.push({ step: "search-recover", url: targetUrl });
     } else {
       return cacheSet(key, { steps, error: "no files found in folder", direct_links: [], android_intent: "" });
@@ -224,7 +264,7 @@ async function mdResolve(startUrl, requestedQuality = null) {
 
   steps.push({ step: "hubcloud_page", url: targetUrl });
   const { data: raw2, request: req2 } = await http.get(targetUrl);
-  steps[steps.length - 1].url = req2.res.responseUrl || targetUrl; // update with redirect
+  steps[steps.length - 1].url = req2.res.responseUrl || targetUrl;
   const doc2 = unescapeHtml(raw2);
 
   let genUrl = (doc2.match(/var\s+url\s*=\s*['"](https?:\/\/[^'"]+)['"]/) || [])[1] || null;
@@ -257,7 +297,7 @@ async function finishGenerator(genUrl, steps, key) {
 // ───────────────────────── Express App ─────────────────────────
 const app = express();
 
-app.get("/health", (_req, res) => res.json({ ok: true, version: "5.2.0" }));
+app.get("/health", (_req, res) => res.json({ ok: true, version: "6.0.0" }));
 
 app.get("/search", async (req, res) => {
   try {
@@ -345,11 +385,10 @@ app.get("/search", async (req, res) => {
 app.get("/download", async (req, res) => {
   try {
     const url = req.query.url;
-    const quality = req.query.quality; // pass quality so folder page picks the right file
     if (!url) return res.status(400).json({ error: "url required" });
     if (!url.includes("mdrive.lol") && !url.includes("hubcloud")) return res.status(400).json({ error: "invalid url" });
 
-    const resolved = await mdResolve(url, quality);
+    const resolved = await mdResolve(url);
     if (resolved.error && !resolved.direct_links?.length) return res.status(502).json({ error: resolved.error, steps: resolved.steps || [] });
 
     res.json({
