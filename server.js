@@ -123,8 +123,7 @@ async function mdPostLinks(permalink) {
   const folderCache = {};
 
   for (const link of rawLinks) {
-    let finalUrl = link.url;
-
+    // If it's a search-recover page, extract ALL qualities from the API
     if (link.url.includes("search-recover.php")) {
       try {
         const urlObj = new URL(link.url);
@@ -142,30 +141,25 @@ async function mdPostLinks(permalink) {
 
         const hits = folderCache[searchQuery];
         if (hits.length > 0) {
-          let bestFile = hits[0];
-          if (link.quality) {
-            const matched = hits.find(h => 
-              h.file_name.toLowerCase().includes(`${link.quality}p`) ||
-              (link.quality === "2160" && h.file_name.toLowerCase().includes("4k"))
-            );
-            if (matched) bestFile = matched;
-          } else if (link.size_gb) {
-            const matched = hits.find(h => {
-              const matchGb = h.size.toLowerCase().match(/([\d.]+)\s*(gb|mb)/i);
-              if (matchGb) {
-                const hSize = parseFloat(matchGb[1]) / (matchGb[2].toLowerCase() === 'mb' ? 1024 : 1);
-                return Math.abs(hSize - link.size_gb) < 0.1;
-              }
-              return false;
+          // Generate an option for EVERY file found in the folder
+          for (const h of hits) {
+            const q = extractQuality(h.file_name) || link.quality;
+            options.push({
+              label: `${q}p [${h.size}]`,
+              url: h.url,
+              quality: q,
+              mode: "single",
+              size_gb: extractSizeGb(`[${h.size}]`),
+              season: link.season
             });
-            if (matched) bestFile = matched;
           }
-          finalUrl = bestFile.url;
+          continue; // skip pushing the raw search-recover link
         }
       } catch (e) {}
     }
 
-    options.push({ ...link, url: finalUrl });
+    // Normal mdrive/hubcloud link
+    options.push(link);
   }
 
   const uniqueOptions = [];
@@ -186,16 +180,14 @@ async function mdResolve(startUrl) {
   const cached = cacheGet(key);
   if (cached) return cached;
 
-  const steps = [];
   let targetUrl = startUrl;
 
   if (startUrl.includes("mdrive.lol")) {
     const { data: rawMd, request: reqMd } = await http.get(startUrl);
-    steps.push({ step: "mdrive", url: reqMd.res.responseUrl || startUrl });
     const docMd = unescapeHtml(rawMd);
     const hcMatch = docMd.match(/<a[^>]+href="(https?:\/\/[^"]*hubcloud[^"]*)"[^>]*>/i) ||
                     docMd.match(/var\s+url\s*=\s*['"](https?:\/\/gamerxyt[^'"]+)['"]/i);
-    if (!hcMatch) return cacheSet(key, { steps, error: "no hubcloud link", direct_links: [], android_intent: "" });
+    if (!hcMatch) return cacheSet(key, { error: "no hubcloud link", direct_links: [], android_intent: "" });
     targetUrl = hcMatch[1].replace(/\\\//g, "/");
   }
 
@@ -211,19 +203,15 @@ async function mdResolve(startUrl) {
     });
     if (apiData && apiData.hits && apiData.hits.length > 0) {
       targetUrl = apiData.hits[0].url;
-      steps.push({ step: "search-recover", url: targetUrl });
     } else {
-      return cacheSet(key, { steps, error: "no files found in folder", direct_links: [], android_intent: "" });
+      return cacheSet(key, { error: "no files found in folder", direct_links: [], android_intent: "" });
     }
   }
 
-  steps.push({ step: "hubcloud_page", url: targetUrl });
   const { data: raw2, request: req2 } = await http.get(targetUrl);
-  steps[steps.length - 1].url = req2.res.responseUrl || targetUrl;
+  const finalHubUrl = req2.res.responseUrl || targetUrl;
   const doc2 = unescapeHtml(raw2);
 
-  // Look for the generator URL
-  // It could be gamerxyt, cryptonewz, or anything else with hubcloud.php
   let genUrl = (doc2.match(/var\s+url\s*=\s*['"](https?:\/\/[^'"]+)['"]/) || [])[1] || null;
   
   if (!genUrl) {
@@ -237,17 +225,14 @@ async function mdResolve(startUrl) {
     });
   }
   
-  if (!genUrl) return cacheSet(key, { steps, error: "no generator url", direct_links: [], android_intent: "" });
+  if (!genUrl) return cacheSet(key, { error: "no generator url", direct_links: [], android_intent: "" });
   
   genUrl = genUrl.replace(/\\\//g, "/");
-  steps.push({ step: "generator", url: genUrl });
-
-  return await finishGenerator(genUrl, steps, key);
+  return await finishGenerator(genUrl, key);
 }
 
-async function finishGenerator(genUrl, steps, key) {
+async function finishGenerator(genUrl, key) {
   const { data: raw3, request: req3 } = await http.get(genUrl);
-  steps.push({ step: "gamerxyt", url: req3.res.responseUrl || genUrl });
   const doc3 = unescapeHtml(raw3);
   
   let pxlUrl = null;
@@ -262,24 +247,27 @@ async function finishGenerator(genUrl, steps, key) {
 
   let gdriveUrl = null;
   if (!fslUrl) {
-      // Look for the 10Gbps pixel.hubcloud.ist link
       const pixelMatch = doc3.match(/href="(https:\/\/pixel\.hubcloud\.ist\/\?id=[^"]+)"/);
       if (pixelMatch) {
           const pixelUrl = pixelMatch[1];
-          steps.push({ step: "pixel_redirect", url: pixelUrl });
-          
           const { data: raw4, request: req4 } = await http.get(pixelUrl);
-          steps.push({ step: "pixel_page", url: req4.res.responseUrl || pixelUrl });
-          const doc4 = unescapeHtml(raw4);
+          const finalPixelUrl = req4.res.responseUrl || pixelUrl;
           
-          // Look for the direct Google Video URL
-          const dlMatch = doc4.match(/(https:\/\/video-downloads\.googleusercontent\.com\/[^\s"'<>]+)/i) || 
-                          doc4.match(/var\s+link\s*=\s*"([^"]+)"/) ||
-                          doc4.match(/href="(https:\/\/video-downloads[^"]+)"/);
-                          
-          if (dlMatch) {
-              gdriveUrl = dlMatch[1];
-              steps.push({ step: "gdrive_extracted", url: gdriveUrl });
+          // If it redirected to cryptonewz.online/dl.php?link=..., extract the link parameter
+          if (finalPixelUrl.includes("dl.php?link=")) {
+            try {
+              const urlObj = new URL(finalPixelUrl);
+              gdriveUrl = urlObj.searchParams.get("link");
+            } catch (e) {}
+          }
+          
+          // Fallback: parse the HTML for the raw googleusercontent link
+          if (!gdriveUrl) {
+              const doc4 = unescapeHtml(raw4);
+              const dlMatch = doc4.match(/(https:\/\/video-downloads\.googleusercontent\.com\/[^\s"'<>]+)/i) || 
+                              doc4.match(/var\s+link\s*=\s*"([^"]+)"/) ||
+                              doc4.match(/href="(https:\/\/video-downloads[^"]+)"/);
+              if (dlMatch) gdriveUrl = dlMatch[1];
           }
       }
   }
@@ -300,13 +288,13 @@ async function finishGenerator(genUrl, steps, key) {
   if (fslUrl) direct.push({ type: "fsl_r2", url: fslUrl });
   if (pxlUrl) direct.push({ type: "pixeldrain", url: pxlUrl });
 
-  return cacheSet(key, { steps, file_name: fname, direct_links: direct, android_intent: android });
+  return cacheSet(key, { file_name: fname, direct_links: direct, android_intent: android });
 }
 
 // ───────────────────────── Express App ─────────────────────────
 const app = express();
 
-app.get("/health", (_req, res) => res.json({ ok: true, version: "9.0.0" }));
+app.get("/health", (_req, res) => res.json({ ok: true, version: "10.0.0" }));
 
 app.get("/search", async (req, res) => {
   try {
@@ -389,14 +377,14 @@ app.get("/download", async (req, res) => {
     if (!url) return res.status(400).json({ error: "url required" });
     
     const resolved = await mdResolve(url);
-    if (resolved.error && !resolved.direct_links?.length) return res.status(502).json({ error: resolved.error, steps: resolved.steps || [] });
+    if (resolved.error && !resolved.direct_links?.length) return res.status(502).json({ error: resolved.error });
 
+    // Stripped the "steps" array so it's super clean for your UI
     res.json({
       source_url: url,
       file_name: resolved.file_name,
       direct_links: resolved.direct_links || [],
       android_intent: resolved.android_intent || "",
-      steps: resolved.steps || [],
     });
   } catch (e) {
     res.status(502).json({ error: e.message });
