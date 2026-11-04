@@ -102,7 +102,7 @@ async function mdSearch(q, page = 1) {
   return cacheSet(key, { found: data.found || 0, results: hits });
 }
 
-// ───────────────────────── Post Scrape (Context-Aware) ─────────────────────────
+// ───────────────────────── Post Scrape ─────────────────────────
 async function mdPostLinks(permalink) {
   const url = permalink.startsWith("http") ? permalink : new URL(permalink, BASE).toString();
   const key = `post:${url}`;
@@ -117,8 +117,6 @@ async function mdPostLinks(permalink) {
   const title = titleMatch ? titleMatch[1].trim() : null;
 
   const options = [];
-  
-  // Scan the body sequentially to inherit context (Season & Quality from headers)
   let currentSeason = null;
   let currentQuality = null;
 
@@ -127,33 +125,23 @@ async function mdPostLinks(permalink) {
     const text = $(el).text().replace(/\s+/g, " ").trim();
     if (!text) return;
 
-    // 1. Check if this element is a header that gives us new context
     if (tag !== "a") {
-      // Look for Season number
       const seasonMatch = text.match(/Season\s+(\d+)/i);
       if (seasonMatch) currentSeason = seasonMatch[1];
-
-      // Look for Quality
       const qMatch = extractQuality(text);
       if (qMatch) currentQuality = qMatch;
-      
-      return; // headers aren't links, skip to next
-    }
-
-    // 2. If it's an anchor, process the link
-    const href = $(el).attr("href");
-    if (!href || !href.startsWith("http")) return;
-    if (!href.includes("mdrive.lol") && !href.includes("hubcloud")) return;
-    
-    const lower = text.toLowerCase();
-    
-    // Check if it's a download button (Zip or Episode)
-    if (!lower.includes("zip") && !lower.includes("episode") && !lower.match(/\d{3,4}p/)) {
       return;
     }
 
-    // For buttons that say just "Zip [x GB]", inherit currentSeason & currentQuality
-    // For buttons that say "1080p Zip", override quality
+    const href = $(el).attr("href");
+    if (!href || !href.startsWith("http")) return;
+    
+    // Catch mdrive, standard hubcloud, AND search-recover links
+    if (!href.includes("mdrive.lol") && !href.includes("hubcloud")) return;
+    
+    const lower = text.toLowerCase();
+    if (!lower.includes("zip") && !lower.includes("episode") && !lower.match(/\d{3,4}p/)) return;
+
     const btnQuality = extractQuality(text) || currentQuality;
     
     options.push({
@@ -162,7 +150,7 @@ async function mdPostLinks(permalink) {
       quality: btnQuality,
       mode: lower.includes("zip") ? "zip" : "single",
       size_gb: extractSizeGb(text),
-      season: currentSeason, // <-- Attached from the header above it!
+      season: currentSeason,
     });
   });
 
@@ -170,14 +158,15 @@ async function mdPostLinks(permalink) {
 }
 
 // ───────────────────────── Resolve ─────────────────────────
-async function mdResolve(startUrl) {
-  const key = `hc:${startUrl}`;
+async function mdResolve(startUrl, requestedQuality = null) {
+  const key = `hc:${startUrl}:${requestedQuality || 'any'}`;
   const cached = cacheGet(key);
   if (cached) return cached;
 
   const steps = [];
-  let hubcloudUrl = startUrl;
+  let targetUrl = startUrl;
 
+  // Step 1: If it's mdrive.lol, follow it to hubcloud
   if (startUrl.includes("mdrive.lol")) {
     const { data: rawMd, request: reqMd } = await http.get(startUrl);
     steps.push({ step: "mdrive", url: reqMd.res.responseUrl || startUrl });
@@ -185,18 +174,57 @@ async function mdResolve(startUrl) {
 
     const hcMatch = docMd.match(/<a[^>]+href="(https?:\/\/[^"]*hubcloud[^"]*)"[^>]*>/i) ||
                     docMd.match(/var\s+url\s*=\s*['"](https?:\/\/gamerxyt[^'"]+)['"]/i);
-
+    
     if (!hcMatch) return cacheSet(key, { steps, error: "no hubcloud link", direct_links: [], android_intent: "" });
-    hubcloudUrl = hcMatch[1].replace(/\\\//g, "/");
-    if (hubcloudUrl.includes("gamerxyt")) return await finishGenerator(hubcloudUrl, steps, key);
-  } else if (!startUrl.includes("hubcloud")) {
-    return cacheSet(key, { steps, error: "invalid url", direct_links: [], android_intent: "" });
+    targetUrl = hcMatch[1].replace(/\\\//g, "/");
   }
 
-  steps.push({ step: "hubcloud_link", url: hubcloudUrl });
+  // Step 2: Handle the special "search-recover.php" folder page directly
+  if (targetUrl.includes("search-recover.php")) {
+    const urlObj = new URL(targetUrl);
+    const b64q = urlObj.searchParams.get("q");
+    let searchQuery = "";
+    if (b64q) {
+      try { searchQuery = Buffer.from(b64q, 'base64').toString('utf-8'); } catch(e){}
+    }
+    
+    const apiUrl = targetUrl.replace(/\/drive\/search-recover\.php.*/, "/drive/search-recover.php");
+    const fromAc = urlObj.searchParams.get("from_ac") || "";
+    
+    const { data: apiData } = await http.get(apiUrl, {
+      params: { api: 'search', q: searchQuery, page: 1, from_ac: fromAc }
+    });
 
-  const { data: raw2, request: req2 } = await http.get(hubcloudUrl);
-  steps.push({ step: "hubcloud_page", url: req2.res.responseUrl || hubcloudUrl });
+    if (apiData && apiData.hits && apiData.hits.length > 0) {
+      // Pick the file that matches the requested quality, fallback to highest quality
+      let bestFile = apiData.hits[0];
+      if (requestedQuality) {
+        const matchedFile = apiData.hits.find(h => 
+          h.file_name.toLowerCase().includes(`${requestedQuality}p`) ||
+          (requestedQuality === "2160" && h.file_name.toLowerCase().includes("4k"))
+        );
+        if (matchedFile) bestFile = matchedFile;
+      }
+
+      targetUrl = bestFile.url; // This will be like https://hubcloud.cx/drive/oht0lt070ottjmc
+      steps.push({ step: "search-recover", url: targetUrl });
+    } else {
+      return cacheSet(key, { steps, error: "no files found in folder", direct_links: [], android_intent: "" });
+    }
+  }
+
+  // Step 3: Normal hubcloud page -> gamerxyt -> direct
+  if (!targetUrl.includes("hubcloud") && !targetUrl.includes("gamerxyt")) {
+    return cacheSet(key, { steps, error: "resolved to unknown URL", direct_links: [], android_intent: "" });
+  }
+
+  if (targetUrl.includes("gamerxyt")) {
+    return await finishGenerator(targetUrl, steps, key);
+  }
+
+  steps.push({ step: "hubcloud_page", url: targetUrl });
+  const { data: raw2, request: req2 } = await http.get(targetUrl);
+  steps[steps.length - 1].url = req2.res.responseUrl || targetUrl; // update with redirect
   const doc2 = unescapeHtml(raw2);
 
   let genUrl = (doc2.match(/var\s+url\s*=\s*['"](https?:\/\/[^'"]+)['"]/) || [])[1] || null;
@@ -226,32 +254,10 @@ async function finishGenerator(genUrl, steps, key) {
   return cacheSet(key, { steps, file_name: fname, direct_links: direct, android_intent: android });
 }
 
-// ───────────────────────── Picking ─────────────────────────
-const SEASON_RE = /season\s*(\d+(?:\s*[–-]\s*\d+)?)/i;
-
-function yearMatch(title, year) {
-  if (!year) return true;
-  return title.includes(String(year));
-}
-
-function seasonInPostTitle(title, season) {
-  if (!season) return true;
-  const m = title.match(SEASON_RE);
-  if (!m) return false;
-  const raw = m[1];
-  const rng = raw.match(/(\d+)\s*[–-]\s*(\d+)/);
-  if (rng) {
-    const lo = parseInt(rng[1], 10); const hi = parseInt(rng[2], 10);
-    const s = parseInt(season, 10);
-    return s >= lo && s <= hi;
-  }
-  return raw.trim() === String(season);
-}
-
 // ───────────────────────── Express App ─────────────────────────
 const app = express();
 
-app.get("/health", (_req, res) => res.json({ ok: true, version: "5.0.0" }));
+app.get("/health", (_req, res) => res.json({ ok: true, version: "5.2.0" }));
 
 app.get("/search", async (req, res) => {
   try {
@@ -267,8 +273,22 @@ app.get("/search", async (req, res) => {
 
     const matched = searchRes.results.filter((r) => {
       const t = r.title || "";
-      if (!yearMatch(t, year)) return false;
-      if (season && !seasonInPostTitle(t, season)) return false;
+      if (year && !t.includes(String(year))) return false;
+      if (season) {
+        const m = t.match(/season\s*(\d+(?:\s*[–-]\s*\d+)?)/i);
+        if (!m) return false;
+        const raw = m[1];
+        const rng = raw.match(/(\d+)\s*[–-]\s*(\d+)/);
+        let ok = false;
+        if (rng) {
+          const lo = parseInt(rng[1], 10); const hi = parseInt(rng[2], 10);
+          const s = parseInt(season, 10);
+          ok = s >= lo && s <= hi;
+        } else {
+          ok = raw.trim() === String(season);
+        }
+        if (!ok) return false;
+      }
       return true;
     });
     const posts = matched.length ? matched : searchRes.results;
@@ -280,15 +300,12 @@ app.get("/search", async (req, res) => {
         let options = post.options;
 
         if (isSeries) {
-          // Series: zip only
           options = options.filter((o) => o.mode === "zip");
           if (season) {
-            // Filter strictly by the inherited season tag
             const withSeason = options.filter((o) => o.season === String(season));
             if (withSeason.length) options = withSeason;
           }
         } else {
-          // Movie: ANY link works (if it has no zip, we want single)
           options = options.filter((o) => o.mode === "single");
         }
 
@@ -296,7 +313,6 @@ app.get("/search", async (req, res) => {
 
         if (!options.length) continue;
 
-        // Deduplicate by URL (since sequential scan might catch nested things)
         const uniqueOptions = [];
         const seenUrls = new Set();
         for (const opt of options) {
@@ -305,8 +321,6 @@ app.get("/search", async (req, res) => {
                uniqueOptions.push(opt);
            }
         }
-
-        // Sort biggest first
         uniqueOptions.sort((a, b) => (b.size_gb || 0) - (a.size_gb || 0));
 
         results.push({
@@ -331,10 +345,11 @@ app.get("/search", async (req, res) => {
 app.get("/download", async (req, res) => {
   try {
     const url = req.query.url;
+    const quality = req.query.quality; // pass quality so folder page picks the right file
     if (!url) return res.status(400).json({ error: "url required" });
     if (!url.includes("mdrive.lol") && !url.includes("hubcloud")) return res.status(400).json({ error: "invalid url" });
 
-    const resolved = await mdResolve(url);
+    const resolved = await mdResolve(url, quality);
     if (resolved.error && !resolved.direct_links?.length) return res.status(502).json({ error: resolved.error, steps: resolved.steps || [] });
 
     res.json({
