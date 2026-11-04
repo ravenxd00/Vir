@@ -32,39 +32,6 @@ function unescapeHtml(s) {
   return s.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#039;/g, "'");
 }
 
-function extractAnchorById(doc, id) {
-  let m = doc.match(new RegExp(`<a\\b[^>]*\\bid\\s*=\\s*["']${id}["'][^>]*\\bhref\\s*=\\s*["']([^"']+)["']`, "i"));
-  if (m) return m[1];
-  m = doc.match(new RegExp(`<a\\b[^>]*\\bhref\\s*=\\s*["']([^"']+)["'][^>]*\\bid\\s*=\\s*["']${id}["']`, "i"));
-  return m ? m[1] : null;
-}
-
-function extractR2Url(doc) {
-  const m = doc.match(/https:\/\/[a-z0-9]+\.r2\.cloudflarestorage\.com\/hub2?\/[^\s"'<>]+/i);
-  return m ? m[0] : null;
-}
-
-function extractPixeldrain(doc) {
-  let m = doc.match(/var\s+pxl\s*=\s*"([^"]+)"/);
-  if (m) return m[1];
-  m = doc.match(/https:\/\/pixeldrain\.dev\/u\/[A-Za-z0-9]+/);
-  return m ? m[0] : null;
-}
-
-function extractFilename(doc) {
-  let m = doc.match(/<div class="card-header[^"]*">\s*([^<]+?)\s*<\/div>/);
-  if (m) return m[1].trim();
-  m = doc.match(/filename%3D%22([^%"]+)%22/);
-  return m ? m[1] : null;
-}
-
-function buildAndroidIntent(r2Url, mime = "application/x-z") {
-  if (!r2Url) return "";
-  const host = r2Url.replace(/^https?:\/\//, "");
-  const fallback = encodeURIComponent(r2Url);
-  return `intent://${host}#Intent;scheme=https;action=android.intent.action.VIEW;type=${mime};S.browser_fallback_url=${fallback};end`;
-}
-
 function extractQuality(text) {
   if (!text) return null;
   const m = text.match(/\b(480p|720p|1080p|2160p|4K)\b/i);
@@ -94,9 +61,6 @@ async function mdSearch(q, page = 1) {
       title: d.post_title,
       permalink: new URL(d.permalink || "", BASE).toString(),
       id: d.id,
-      imdb_id: d.imdb_id,
-      date: d.post_date,
-      categories: d.category || [],
     };
   });
   return cacheSet(key, { found: data.found || 0, results: hits });
@@ -120,8 +84,6 @@ async function mdPostLinks(permalink) {
   const options = [];
   let currentSeason = null;
   let currentQuality = null;
-
-  // We collect links first, then resolve folder links in parallel
   const rawLinks = [];
 
   $("body").find("h1, h2, h3, h4, h5, h6, p, div, a").each((_, el) => {
@@ -158,55 +120,64 @@ async function mdPostLinks(permalink) {
     });
   });
 
-  // Resolve search-recover pages to direct hubcloud links
+  const folderCache = {};
+
   for (const link of rawLinks) {
+    let finalUrl = link.url;
+
     if (link.url.includes("search-recover.php")) {
       try {
         const urlObj = new URL(link.url);
         const b64q = urlObj.searchParams.get("q");
-        let searchQuery = "";
-        if (b64q) searchQuery = Buffer.from(b64q, 'base64').toString('utf-8');
+        const searchQuery = b64q ? Buffer.from(b64q, 'base64').toString('utf-8') : "";
         
-        const apiUrl = link.url.replace(/\/drive\/search-recover\.php.*/, "/drive/search-recover.php");
-        const fromAc = urlObj.searchParams.get("from_ac") || "";
-        
-        const { data: apiData } = await http.get(apiUrl, {
-          params: { api: 'search', q: searchQuery, page: 1, from_ac: fromAc }
-        });
+        if (!folderCache[searchQuery]) {
+          const apiUrl = link.url.replace(/\/drive\/search-recover\.php.*/, "/drive/search-recover.php");
+          const fromAc = urlObj.searchParams.get("from_ac") || "";
+          const { data: apiData } = await http.get(apiUrl, {
+            params: { api: 'search', q: searchQuery, page: 1, from_ac: fromAc }
+          });
+          folderCache[searchQuery] = (apiData && apiData.hits) ? apiData.hits : [];
+        }
 
-        if (apiData && apiData.hits && apiData.hits.length > 0) {
-          // Find the file that matches the label text or size
-          let bestFile = apiData.hits[0];
+        const hits = folderCache[searchQuery];
+        if (hits.length > 0) {
+          let bestFile = hits[0];
           if (link.quality) {
-            const matched = apiData.hits.find(h => 
+            const matched = hits.find(h => 
               h.file_name.toLowerCase().includes(`${link.quality}p`) ||
               (link.quality === "2160" && h.file_name.toLowerCase().includes("4k"))
             );
             if (matched) bestFile = matched;
           } else if (link.size_gb) {
-            const matched = apiData.hits.find(h => {
-              const sizeStr = h.size.toLowerCase();
-              const matchGb = sizeStr.match(/([\d.]+)\s*(gb|mb)/i);
+            const matched = hits.find(h => {
+              const matchGb = h.size.toLowerCase().match(/([\d.]+)\s*(gb|mb)/i);
               if (matchGb) {
                 const hSize = parseFloat(matchGb[1]) / (matchGb[2].toLowerCase() === 'mb' ? 1024 : 1);
-                return Math.abs(hSize - link.size_gb) < 0.1; // within 100MB
+                return Math.abs(hSize - link.size_gb) < 0.1;
               }
               return false;
             });
             if (matched) bestFile = matched;
           }
-          
-          // Replace the search-recover URL with the direct hubcloud drive URL
-          link.url = bestFile.url;
+          finalUrl = bestFile.url;
         }
-      } catch (e) {
-        // If API fails, leave the search-recover URL (mdResolve will handle it as fallback)
-      }
+      } catch (e) {}
     }
-    options.push(link);
+
+    options.push({ ...link, url: finalUrl });
   }
 
-  return cacheSet(key, { title, url, options });
+  const uniqueOptions = [];
+  const seenUrls = new Set();
+  for (const opt of options) {
+    if (!seenUrls.has(opt.url)) {
+      seenUrls.add(opt.url);
+      uniqueOptions.push(opt);
+    }
+  }
+
+  return cacheSet(key, { title, url, options: uniqueOptions });
 }
 
 // ───────────────────────── Resolve ─────────────────────────
@@ -218,33 +189,26 @@ async function mdResolve(startUrl) {
   const steps = [];
   let targetUrl = startUrl;
 
-  // Step 1: If it's mdrive.lol, follow it to hubcloud
   if (startUrl.includes("mdrive.lol")) {
     const { data: rawMd, request: reqMd } = await http.get(startUrl);
     steps.push({ step: "mdrive", url: reqMd.res.responseUrl || startUrl });
     const docMd = unescapeHtml(rawMd);
-
     const hcMatch = docMd.match(/<a[^>]+href="(https?:\/\/[^"]*hubcloud[^"]*)"[^>]*>/i) ||
                     docMd.match(/var\s+url\s*=\s*['"](https?:\/\/gamerxyt[^'"]+)['"]/i);
-    
     if (!hcMatch) return cacheSet(key, { steps, error: "no hubcloud link", direct_links: [], android_intent: "" });
     targetUrl = hcMatch[1].replace(/\\\//g, "/");
   }
 
-  // Step 2: Handle search-recover fallback (if it wasn't resolved in mdPostLinks)
   if (targetUrl.includes("search-recover.php")) {
     const urlObj = new URL(targetUrl);
     const b64q = urlObj.searchParams.get("q");
     let searchQuery = "";
     if (b64q) searchQuery = Buffer.from(b64q, 'base64').toString('utf-8');
-    
     const apiUrl = targetUrl.replace(/\/drive\/search-recover\.php.*/, "/drive/search-recover.php");
     const fromAc = urlObj.searchParams.get("from_ac") || "";
-    
     const { data: apiData } = await http.get(apiUrl, {
       params: { api: 'search', q: searchQuery, page: 1, from_ac: fromAc }
     });
-
     if (apiData && apiData.hits && apiData.hits.length > 0) {
       targetUrl = apiData.hits[0].url;
       steps.push({ step: "search-recover", url: targetUrl });
@@ -253,22 +217,26 @@ async function mdResolve(startUrl) {
     }
   }
 
-  // Step 3: Normal hubcloud page -> gamerxyt -> direct
-  if (!targetUrl.includes("hubcloud") && !targetUrl.includes("gamerxyt")) {
-    return cacheSet(key, { steps, error: "resolved to unknown URL", direct_links: [], android_intent: "" });
-  }
-
-  if (targetUrl.includes("gamerxyt")) {
-    return await finishGenerator(targetUrl, steps, key);
-  }
-
   steps.push({ step: "hubcloud_page", url: targetUrl });
   const { data: raw2, request: req2 } = await http.get(targetUrl);
   steps[steps.length - 1].url = req2.res.responseUrl || targetUrl;
   const doc2 = unescapeHtml(raw2);
 
+  // Look for the generator URL
+  // It could be gamerxyt, cryptonewz, or anything else with hubcloud.php
   let genUrl = (doc2.match(/var\s+url\s*=\s*['"](https?:\/\/[^'"]+)['"]/) || [])[1] || null;
-  if (!genUrl) genUrl = extractAnchorById(doc2, "download");
+  
+  if (!genUrl) {
+    const $ = cheerio.load(doc2);
+    $('a').each((_, el) => {
+      const href = $(el).attr('href');
+      const text = $(el).text().toLowerCase();
+      if (href && (href.includes('hubcloud.php') || text.includes('generate direct'))) {
+        genUrl = href;
+      }
+    });
+  }
+  
   if (!genUrl) return cacheSet(key, { steps, error: "no generator url", direct_links: [], android_intent: "" });
   
   genUrl = genUrl.replace(/\\\//g, "/");
@@ -281,13 +249,54 @@ async function finishGenerator(genUrl, steps, key) {
   const { data: raw3, request: req3 } = await http.get(genUrl);
   steps.push({ step: "gamerxyt", url: req3.res.responseUrl || genUrl });
   const doc3 = unescapeHtml(raw3);
+  
+  let pxlUrl = null;
+  const pxlMatch = doc3.match(/var\s+pxl\s*=\s*"([^"]+)"/) || doc3.match(/https:\/\/pixeldrain\.dev\/u\/[A-Za-z0-9]+/);
+  if (pxlMatch) pxlUrl = pxlMatch[1] || pxlMatch[0];
 
-  const fslUrl = extractAnchorById(doc3, "fsl") || extractR2Url(doc3);
-  const pxlUrl = extractPixeldrain(doc3);
-  const fname = extractFilename(doc3);
-  const android = fslUrl ? buildAndroidIntent(fslUrl) : "";
+  const fname = (doc3.match(/<div class="card-header[^"]*">\s*([^<]+?)\s*<\/div>/) || [])[1] || null;
+
+  let fslUrl = null;
+  const r2Match = doc3.match(/https:\/\/[a-z0-9]+\.r2\.cloudflarestorage\.com\/hub2?\/[^\s"'<>]+/i);
+  if (r2Match) fslUrl = r2Match[0];
+
+  let gdriveUrl = null;
+  if (!fslUrl) {
+      // Look for the 10Gbps pixel.hubcloud.ist link
+      const pixelMatch = doc3.match(/href="(https:\/\/pixel\.hubcloud\.ist\/\?id=[^"]+)"/);
+      if (pixelMatch) {
+          const pixelUrl = pixelMatch[1];
+          steps.push({ step: "pixel_redirect", url: pixelUrl });
+          
+          const { data: raw4, request: req4 } = await http.get(pixelUrl);
+          steps.push({ step: "pixel_page", url: req4.res.responseUrl || pixelUrl });
+          const doc4 = unescapeHtml(raw4);
+          
+          // Look for the direct Google Video URL
+          const dlMatch = doc4.match(/(https:\/\/video-downloads\.googleusercontent\.com\/[^\s"'<>]+)/i) || 
+                          doc4.match(/var\s+link\s*=\s*"([^"]+)"/) ||
+                          doc4.match(/href="(https:\/\/video-downloads[^"]+)"/);
+                          
+          if (dlMatch) {
+              gdriveUrl = dlMatch[1];
+              steps.push({ step: "gdrive_extracted", url: gdriveUrl });
+          }
+      }
+  }
+
+  let android = "";
+  if (gdriveUrl) {
+      const host = gdriveUrl.replace(/^https?:\/\//, "");
+      const fallback = encodeURIComponent(gdriveUrl);
+      android = `intent://${host}#Intent;scheme=https;action=android.intent.action.VIEW;type=video/x-matroska;S.browser_fallback_url=${fallback};end`;
+  } else if (fslUrl) {
+      const host = fslUrl.replace(/^https?:\/\//, "");
+      const fallback = encodeURIComponent(fslUrl);
+      android = `intent://${host}#Intent;scheme=https;action=android.intent.action.VIEW;type=application/x-z;S.browser_fallback_url=${fallback};end`;
+  }
 
   const direct = [];
+  if (gdriveUrl) direct.push({ type: "10gbps_gdrive", url: gdriveUrl });
   if (fslUrl) direct.push({ type: "fsl_r2", url: fslUrl });
   if (pxlUrl) direct.push({ type: "pixeldrain", url: pxlUrl });
 
@@ -297,7 +306,7 @@ async function finishGenerator(genUrl, steps, key) {
 // ───────────────────────── Express App ─────────────────────────
 const app = express();
 
-app.get("/health", (_req, res) => res.json({ ok: true, version: "6.0.0" }));
+app.get("/health", (_req, res) => res.json({ ok: true, version: "9.0.0" }));
 
 app.get("/search", async (req, res) => {
   try {
@@ -353,21 +362,13 @@ app.get("/search", async (req, res) => {
 
         if (!options.length) continue;
 
-        const uniqueOptions = [];
-        const seenUrls = new Set();
-        for (const opt of options) {
-           if (!seenUrls.has(opt.url)) {
-               seenUrls.add(opt.url);
-               uniqueOptions.push(opt);
-           }
-        }
-        uniqueOptions.sort((a, b) => (b.size_gb || 0) - (a.size_gb || 0));
+        options.sort((a, b) => (b.size_gb || 0) - (a.size_gb || 0));
 
         results.push({
           title: post.title,
           permalink: post.url,
           type,
-          options: uniqueOptions,
+          options,
         });
       } catch (e) {
         continue;
@@ -386,8 +387,7 @@ app.get("/download", async (req, res) => {
   try {
     const url = req.query.url;
     if (!url) return res.status(400).json({ error: "url required" });
-    if (!url.includes("mdrive.lol") && !url.includes("hubcloud")) return res.status(400).json({ error: "invalid url" });
-
+    
     const resolved = await mdResolve(url);
     if (resolved.error && !resolved.direct_links?.length) return res.status(502).json({ error: resolved.error, steps: resolved.steps || [] });
 
