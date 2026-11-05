@@ -54,7 +54,8 @@ async function mdSearch(q, page = 1) {
   const cached = cacheGet(key);
   if (cached) return cached;
 
-  const { data } = await http.get(TYPESENSE, { params: { q, page } });
+  const cleanQ = q.replace(/-/g, " ").trim();
+  const { data } = await http.get(TYPESENSE, { params: { q: cleanQ, page } });
   const hits = (data.hits || []).map((h) => {
     const d = h.document || {};
     return {
@@ -123,7 +124,6 @@ async function mdPostLinks(permalink) {
   const folderCache = {};
 
   for (const link of rawLinks) {
-    // If it's a search-recover page, extract ALL qualities from the API
     if (link.url.includes("search-recover.php")) {
       try {
         const urlObj = new URL(link.url);
@@ -141,7 +141,6 @@ async function mdPostLinks(permalink) {
 
         const hits = folderCache[searchQuery];
         if (hits.length > 0) {
-          // Generate an option for EVERY file found in the folder
           for (const h of hits) {
             const q = extractQuality(h.file_name) || link.quality;
             options.push({
@@ -153,12 +152,10 @@ async function mdPostLinks(permalink) {
               season: link.season
             });
           }
-          continue; // skip pushing the raw search-recover link
+          continue;
         }
       } catch (e) {}
     }
-
-    // Normal mdrive/hubcloud link
     options.push(link);
   }
 
@@ -246,29 +243,27 @@ async function finishGenerator(genUrl, key) {
   if (r2Match) fslUrl = r2Match[0];
 
   let gdriveUrl = null;
-  if (!fslUrl) {
-      const pixelMatch = doc3.match(/href="(https:\/\/pixel\.hubcloud\.ist\/\?id=[^"]+)"/);
-      if (pixelMatch) {
-          const pixelUrl = pixelMatch[1];
-          const { data: raw4, request: req4 } = await http.get(pixelUrl);
-          const finalPixelUrl = req4.res.responseUrl || pixelUrl;
-          
-          // If it redirected to cryptonewz.online/dl.php?link=..., extract the link parameter
-          if (finalPixelUrl.includes("dl.php?link=")) {
-            try {
-              const urlObj = new URL(finalPixelUrl);
-              gdriveUrl = urlObj.searchParams.get("link");
-            } catch (e) {}
-          }
-          
-          // Fallback: parse the HTML for the raw googleusercontent link
-          if (!gdriveUrl) {
-              const doc4 = unescapeHtml(raw4);
-              const dlMatch = doc4.match(/(https:\/\/video-downloads\.googleusercontent\.com\/[^\s"'<>]+)/i) || 
-                              doc4.match(/var\s+link\s*=\s*"([^"]+)"/) ||
-                              doc4.match(/href="(https:\/\/video-downloads[^"]+)"/);
-              if (dlMatch) gdriveUrl = dlMatch[1];
-          }
+  
+  const pixelMatch = doc3.match(/href="(https:\/\/pixel\.hubcloud\.ist\/\?id=[^"]+)"/);
+  if (pixelMatch) {
+      const pixelUrl = pixelMatch[1];
+      const { data: raw4, request: req4 } = await http.get(pixelUrl);
+      const finalPixelUrl = req4.res.responseUrl || pixelUrl;
+      const doc4 = unescapeHtml(raw4);
+      
+      if (finalPixelUrl.includes("dl.php?link=")) {
+        try {
+          const urlObj = new URL(finalPixelUrl);
+          gdriveUrl = urlObj.searchParams.get("link");
+        } catch (e) {}
+      }
+      
+      if (!gdriveUrl) {
+          // Aggressive extraction for cryptonewz/bgmi page
+          const dlMatch = doc4.match(/(https:\/\/video-downloads\.googleusercontent\.com\/[^\s"'<>\\]+)/i) || 
+                          doc4.match(/var\s+link\s*=\s*['"]([^'"]+)['"]/) ||
+                          doc4.match(/href\s*=\s*['"](https:\/\/video-downloads[^'"]+)['"]/);
+          if (dlMatch) gdriveUrl = dlMatch[1];
       }
   }
 
@@ -277,10 +272,6 @@ async function finishGenerator(genUrl, key) {
       const host = gdriveUrl.replace(/^https?:\/\//, "");
       const fallback = encodeURIComponent(gdriveUrl);
       android = `intent://${host}#Intent;scheme=https;action=android.intent.action.VIEW;type=video/x-matroska;S.browser_fallback_url=${fallback};end`;
-  } else if (fslUrl) {
-      const host = fslUrl.replace(/^https?:\/\//, "");
-      const fallback = encodeURIComponent(fslUrl);
-      android = `intent://${host}#Intent;scheme=https;action=android.intent.action.VIEW;type=application/x-z;S.browser_fallback_url=${fallback};end`;
   }
 
   const direct = [];
@@ -293,8 +284,7 @@ async function finishGenerator(genUrl, key) {
 
 // ───────────────────────── Express App ─────────────────────────
 const app = express();
-
-app.get("/health", (_req, res) => res.json({ ok: true, version: "10.0.0" }));
+app.get("/health", (_req, res) => res.json({ ok: true, version: "11.0.0" }));
 
 app.get("/search", async (req, res) => {
   try {
@@ -347,48 +337,27 @@ app.get("/search", async (req, res) => {
         }
 
         if (quality) options = options.filter((o) => o.quality === String(quality));
-
         if (!options.length) continue;
 
         options.sort((a, b) => (b.size_gb || 0) - (a.size_gb || 0));
 
-        results.push({
-          title: post.title,
-          permalink: post.url,
-          type,
-          options,
-        });
-      } catch (e) {
-        continue;
-      }
+        results.push({ title: post.title, permalink: post.url, type, options });
+      } catch (e) { continue; }
     }
 
-    if (!results.length) return res.status(404).json({ error: `no ${type} downloads found${quality ? ` at ${quality}p` : ""}` });
-
+    if (!results.length) return res.status(404).json({ error: `no ${type} downloads found` });
     res.json({ query: { title, type, year, season, quality }, found: results.length, results });
-  } catch (e) {
-    res.status(502).json({ error: e.message });
-  }
+  } catch (e) { res.status(502).json({ error: e.message }); }
 });
 
 app.get("/download", async (req, res) => {
   try {
     const url = req.query.url;
     if (!url) return res.status(400).json({ error: "url required" });
-    
     const resolved = await mdResolve(url);
     if (resolved.error && !resolved.direct_links?.length) return res.status(502).json({ error: resolved.error });
-
-    // Stripped the "steps" array so it's super clean for your UI
-    res.json({
-      source_url: url,
-      file_name: resolved.file_name,
-      direct_links: resolved.direct_links || [],
-      android_intent: resolved.android_intent || "",
-    });
-  } catch (e) {
-    res.status(502).json({ error: e.message });
-  }
+    res.json({ source_url: url, file_name: resolved.file_name, direct_links: resolved.direct_links || [], android_intent: resolved.android_intent || "" });
+  } catch (e) { res.status(502).json({ error: e.message }); }
 });
 
 const PORT = process.env.PORT || 8000;
